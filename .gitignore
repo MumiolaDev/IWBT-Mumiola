@@ -1,0 +1,14 @@
+# Emulador: clon aparte de OpenGMK con el parche aplicado (lo crea scripts/build.sh)
+/vendor/
+
+# Juego y derivados: contenido de terceros, no se versiona
+/game/
+/decompiled/
+/i_wanna_be_the_GB.zip
+
+# Resultados de entrenamientos (enlace a /mnt/datos/iwbtgb/corridas)
+/corridas
+
+.venv/
+__pycache__/
+*.pyc

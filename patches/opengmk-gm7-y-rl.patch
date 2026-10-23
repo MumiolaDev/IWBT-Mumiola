@@ -1,0 +1,2380 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 87c18d6..4409d58 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -385,9 +385,11 @@ dependencies = [
+  "gm8exe",
+  "gml-parser",
+  "hex",
++ "hound",
+  "image",
+  "imgui",
+  "indexmap",
++ "lewton",
+  "libc",
+  "libffi",
+  "lzzzz",
+@@ -431,6 +433,12 @@ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+ 
++[[package]]
++name = "hound"
++version = "3.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
++
+ [[package]]
+ name = "ident_case"
+ version = "1.0.1"
+@@ -517,6 +525,17 @@ version = "3.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+ 
++[[package]]
++name = "lewton"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "777b48df9aaab155475a83a7df3070395ea1ac6902f5cd062b8f2b028075c030"
++dependencies = [
++ "byteorder",
++ "ogg",
++ "tinyvec",
++]
++
+ [[package]]
+ name = "libc"
+ version = "0.2.185"
+@@ -673,6 +692,15 @@ dependencies = [
+  "objc",
+ ]
+ 
++[[package]]
++name = "ogg"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6951b4e8bf21c8193da321bcce9c9dd2e13c858fe078bf9054a288b419ae5d6e"
++dependencies = [
++ "byteorder",
++]
++
+ [[package]]
+ name = "once_cell"
+ version = "1.21.4"
+@@ -1031,6 +1059,12 @@ dependencies = [
+  "crunchy",
+ ]
+ 
++[[package]]
++name = "tinyvec"
++version = "1.13.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
++
+ [[package]]
+ name = "toml"
+ version = "0.5.11"
+diff --git a/gm8emulator/Cargo.toml b/gm8emulator/Cargo.toml
+index 2e12491..18bc7ce 100644
+--- a/gm8emulator/Cargo.toml
++++ b/gm8emulator/Cargo.toml
+@@ -31,6 +31,8 @@ lzzzz = "2.0"
+ phf = { version = "0.13", features = ["macros"] }
+ ramen = { git = "https://github.com/viriuwu/ramen", features = ["input", "parking-lot"] }
+ rect_packer = "0.2"
++hound = "3.5"
++lewton = "0.10"
+ rmp3 = { version = "0.3", features = ["float"] }
+ rust-ini = "0.21"
+ serde = { version = "1.0", features = ["derive", "rc"] }
+diff --git a/gm8emulator/src/game.rs b/gm8emulator/src/game.rs
+index bcf855f..daf2692 100644
+--- a/gm8emulator/src/game.rs
++++ b/gm8emulator/src/game.rs
+@@ -12,6 +12,7 @@ pub mod pathfinding;
+ pub mod platform;
+ pub mod recording;
+ pub mod replay;
++pub mod rl;
+ pub mod savestate;
+ pub mod surface;
+ pub mod transition;
+@@ -222,6 +223,7 @@ pub struct Game {
+     pub ffmpeg_recorder: Option<Child>,
+ 
+     pub audio: audio::AudioManager,
++    pub fmod: external::fmod::Fmod,
+ 
+     // winit windowing
+     pub window: Window,
+@@ -256,6 +258,8 @@ pub enum PlayType {
+     Normal,
+     Record,
+     Replay,
++    /// Driven frame-by-frame by an external reinforcement learning client (see `game/rl.rs`)
++    Rl,
+ }
+ 
+ /// Various different types of scene change which can be requested by GML
+@@ -615,7 +619,7 @@ impl Game {
+             .resizable(match play_type {
+                 PlayType::Normal => settings.allow_resize,
+                 PlayType::Record => true,
+-                PlayType::Replay => false,
++                PlayType::Replay | PlayType::Rl => false,
+             })
+             .controls(if play_type == PlayType::Record {
+                 Some(Controls::new())
+@@ -662,7 +666,7 @@ impl Game {
+         });
+ 
+         // Set up audio manager
+-        let mut audio = audio::AudioManager::new(play_type != PlayType::Record, capture_recording);
++        let mut audio = audio::AudioManager::new(play_type != PlayType::Record && play_type != PlayType::Rl, capture_recording);
+ 
+         // TODO: specific flags here (make wb mutable)
+ 
+@@ -1370,6 +1374,11 @@ impl Game {
+             health_capt_d: false,
+             error_occurred: false,
+             error_last: "".to_string().into(),
++            fmod: {
++                let mut fmod = external::fmod::Fmod::new();
++                fmod.set_output(audio.stream_output());
++                fmod
++            },
+             audio,
+             window,
+             window_border,
+@@ -1427,7 +1436,9 @@ impl Game {
+         game.globals.vars.clear();
+         game.globalvars.clear();
+ 
+-        game.window.set_visible(true);
++        if game.play_type != PlayType::Rl || std::env::var_os("OPENGMK_RL_SHOW").is_some() {
++            game.window.set_visible(true);
++        }
+ 
+         Ok(game)
+     }
+@@ -1878,6 +1889,9 @@ impl Game {
+             return Ok(());
+         }
+ 
++        // Audio de DLL emuladas (FMOD): avanza un paso lógico
++        self.fmod.step(self.room.speed);
++
+         // Update xprevious and yprevious for all instances
+         let mut iter = self.room.instance_list.iter_by_drawing();
+         while let Some(instance) = iter.next(&self.room.instance_list).map(|x| self.room.instance_list.get(x)) {
+@@ -2120,6 +2134,10 @@ impl Game {
+             };
+             match &external.call {
+                 external::Call::Dummy(x) => Ok(x.clone()),
++                external::Call::Missing(x) => {
++                    external::emulated::report_missing(&external.signature);
++                    Ok(x.clone())
++                },
+                 &external::Call::Emulated(func) => func.invoke(self, context, args),
+                 external::Call::Native(_) => {
+                     let args = convert_args();
+diff --git a/gm8emulator/src/game/audio.rs b/gm8emulator/src/game/audio.rs
+index 72de3bd..7678f91 100644
+--- a/gm8emulator/src/game/audio.rs
++++ b/gm8emulator/src/game/audio.rs
+@@ -57,6 +57,34 @@ pub struct AudioManager {
+     end_times: HashMap<i32, Option<u128>>,
+     multimedia_end: Option<(i32, Option<u128>)>,
+     audio_recorder: Option<Child>,
++    stream: Option<crate::game::external::fmod::OutputQueue>,
++}
++
++/// Id del mezclador reservado para el audio de DLL emuladas (FMOD).
++const STREAM_ID: i32 = i32::MIN;
++
++/// Fuente que reproduce lo que el FMOD emulado deja en su cola (estéreo, 44,1 kHz). Si la cola se vacía,
++/// entrega silencio.
++struct StreamSource(crate::game::external::fmod::OutputQueue);
++
++impl Source for StreamSource {
++    fn channel_count(&self) -> ChannelCount {
++        ChannelCount::new(2).unwrap()
++    }
++
++    fn sample_rate(&self) -> SampleRate {
++        SampleRate::new(crate::game::external::fmod::RATE).unwrap()
++    }
++
++    fn write_samples(&mut self, buffer: &mut [Sample]) -> usize {
++        let mut q = self.0.lock().unwrap();
++        for s in buffer.iter_mut() {
++            *s = q.pop_front().unwrap_or(0.0);
++        }
++        buffer.len()
++    }
++
++    fn reset(&mut self) {}
+ }
+ 
+ pub struct InterprocessSource {
+@@ -139,6 +167,7 @@ impl AudioManager {
+                 end_times: HashMap::new(),
+                 multimedia_end: None,
+                 audio_recorder: audio_recorder,
++                stream: None,
+             };
+         } else {
+             std::thread::spawn(move || {
+@@ -158,10 +187,34 @@ impl AudioManager {
+                 end_times: HashMap::new(),
+                 multimedia_end: None,
+                 audio_recorder: audio_recorder,
++                stream: None,
+             }
+         }
+     }
+ 
++    /// Crea la cola de salida para el FMOD emulado y la conecta al mezclador. `None` si no hay salida de audio.
++    pub fn stream_output(&mut self) -> Option<crate::game::external::fmod::OutputQueue> {
++        if !self.do_output {
++            return None
++        }
++        let queue = self.stream.get_or_insert_with(Default::default).clone();
++        self.attach_stream();
++        Some(queue)
++    }
++
++    fn attach_stream(&self) {
++        if let Some(queue) = &self.stream {
++            let _ = self.mixer_handle.add(
++                Rechanneler::new(
++                    Resampler::new(StreamSource(queue.clone()), self.mixer_sample_rate),
++                    self.mixer_channel_count,
++                ),
++                Arc::new(SoundParams { volume: AtomicU32::new(1.0f32.to_bits()) }),
++                STREAM_ID,
++            );
++        }
++    }
++
+     pub fn capture_audio(&mut self) {
+         if let Some(mixer) = &mut self.mixer {
+             // samplerate / framerate * channels
+@@ -322,6 +375,7 @@ impl AudioManager {
+         self.multimedia_end = None;
+         if self.do_output {
+             let _ = self.mixer_handle.stop_all();
++            self.attach_stream();
+         }
+     }
+ 
+diff --git a/gm8emulator/src/game/external.rs b/gm8emulator/src/game/external.rs
+index cd50a1a..6468aa3 100644
+--- a/gm8emulator/src/game/external.rs
++++ b/gm8emulator/src/game/external.rs
+@@ -1,5 +1,7 @@
+ pub mod dll;
+ mod dummy;
++pub mod emulated;
++pub mod fmod;
+ pub mod win32;
+ mod wow64;
+ 
+@@ -22,6 +24,8 @@ pub use native::NativeExternal;
+ pub enum Call {
+     Dummy(gml::Value),
+     Emulated(Function),
++    /// Función de una DLL emulada sin reimplementación: devuelve este valor y avisa la primera vez.
++    Missing(gml::Value),
+     Native(NativeExternal),
+     Ipc(ipc::IpcExternal),
+ }
+@@ -55,6 +59,13 @@ impl ExternalManager {
+     }
+ 
+     fn make_call(&mut self, signature: &dll::ExternalSignature) -> Result<Call, String> {
++        // Las reimplementaciones van primero: son deterministas, así que valen también al grabar.
++        if let Some(emulation) = emulated::find(&signature) {
++            return Ok(match emulation {
++                emulated::Emulation::Function(f) => Call::Emulated(f),
++                emulated::Emulation::Missing(v) => Call::Missing(v),
++            })
++        }
+         if let Some(dummy) = self.should_dummy(&signature) {
+             return Ok(Call::Dummy(dummy))
+         }
+diff --git a/gm8emulator/src/game/external/emulated.rs b/gm8emulator/src/game/external/emulated.rs
+new file mode 100644
+index 0000000..f9d8912
+--- /dev/null
++++ b/gm8emulator/src/game/external/emulated.rs
+@@ -0,0 +1,264 @@
++//! Reimplementaciones en Rust de DLL comunes en juegos de GameMaker, para plataformas donde no se pueden
++//! cargar DLL de Windows (Linux sin Wine, Android).
++//!
++//! - gm82core / gm82dx8 / gm82joy (extensiones de Game Maker 8.2, https://github.com/GM82Project):
++//!   solo las funciones que hacen falta para arrancar y las de matemática; lo que depende de Direct3D o de la
++//!   ventana de Windows devuelve un valor neutro.
++//! - SDL2 (lo carga gm82joy): solo SDL_GetError.
++//! - GMFMODSimple: reimplementado en `fmod.rs`, con el estado guardado en `Game::fmod`.
++//! - fmodex: solo se usa para comprobar que existe; todo devuelve 0.
++//!
++//! Las funciones que no están en la tabla de una DLL conocida devuelven 0 o "" según su tipo de retorno.
++
++use super::dll::{ExternalSignature, ValueType};
++use crate::{
++    game::Game,
++    gml::{self, Function, Value},
++};
++
++/// Nombre de archivo de la DLL en minúsculas, aceptando separadores de Windows y de Unix.
++fn dll_basename(dll: &str) -> String {
++    dll.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(dll).to_ascii_lowercase()
++}
++
++fn arg(args: &[Value], i: usize) -> f64 {
++    args.get(i).cloned().map(f64::from).unwrap_or(0.0)
++}
++
++fn dsin(deg: f64) -> f64 {
++    (deg / 180.0 * std::f64::consts::PI).sin()
++}
++
++fn dcos(deg: f64) -> f64 {
++    (deg / 180.0 * std::f64::consts::PI).cos()
++}
++
++/// Microsegundos según el reloj del juego (falseado y determinista en grabación y replay).
++fn micros(game: &Game) -> f64 {
++    (game.clock.as_nanos() / 1000) as f64
++}
++
++// ---- gm82core ----
++
++fn ret_820(_: &[Value]) -> gml::Result<Value> {
++    Ok(820.into())
++}
++
++fn ret_0(_: &[Value]) -> gml::Result<Value> {
++    Ok(0.into())
++}
++
++fn ret_1(_: &[Value]) -> gml::Result<Value> {
++    Ok(1.into())
++}
++
++fn ret_empty(_: &[Value]) -> gml::Result<Value> {
++    Ok("".into())
++}
++
++fn hrt_now(game: &Game, _: &[Value]) -> gml::Result<Value> {
++    Ok(micros(game).into())
++}
++
++fn approach(args: &[Value]) -> gml::Result<Value> {
++    let (val, go, step) = (arg(args, 0), arg(args, 1), arg(args, 2));
++    Ok(if val < go { go.min(val + step) } else { go.max(val - step) }.into())
++}
++
++fn gm82_dsin(args: &[Value]) -> gml::Result<Value> {
++    Ok(dsin(arg(args, 0)).into())
++}
++
++fn gm82_dcos(args: &[Value]) -> gml::Result<Value> {
++    Ok(dcos(arg(args, 0)).into())
++}
++
++fn in_range(args: &[Value]) -> gml::Result<Value> {
++    let (val, min, max) = (arg(args, 0), arg(args, 1), arg(args, 2));
++    Ok(Value::from(val >= min && val <= max))
++}
++
++fn pivot_pos_x(args: &[Value]) -> gml::Result<Value> {
++    let (px, py, dir) = (arg(args, 0), arg(args, 1), arg(args, 2));
++    Ok((px * dcos(dir) + py * dcos(dir - 90.0)).into())
++}
++
++fn pivot_pos_y(args: &[Value]) -> gml::Result<Value> {
++    let (px, py, dir) = (arg(args, 0), arg(args, 1), arg(args, 2));
++    Ok((-px * dsin(dir) - py * dsin(dir - 90.0)).into())
++}
++
++fn get_windows_version(_: &[Value]) -> gml::Result<Value> {
++    Ok(10.into())
++}
++
++/// LCID de Windows a partir del idioma del sistema (variable LANG en Unix).
++fn io_get_language(_: &[Value]) -> gml::Result<Value> {
++    let lang = std::env::var("OPENGMK_LANG").or_else(|_| std::env::var("LANG")).unwrap_or_default();
++    let lcid = match lang.get(..2) {
++        Some("es") => 0x0C0A,
++        Some("ja") => 0x0411,
++        Some("pt") => 0x0416,
++        Some("fr") => 0x040C,
++        Some("de") => 0x0407,
++        _ => 0x0409,
++    };
++    Ok(lcid.into())
++}
++
++/// Color de acento de la barra de título (azul por defecto de Windows 10, en BGR).
++fn get_window_col(_: &[Value]) -> gml::Result<Value> {
++    Ok(0xD77800.into())
++}
++
++// ---- gm82dx8 ----
++
++fn dx8_max_texture_size(game: &Game, _: &[Value]) -> gml::Result<Value> {
++    Ok(f64::from(game.renderer.max_texture_size()).into())
++}
++
++/// VRAM libre en MB. No hay forma portátil de saberlo; se informa una cantidad holgada.
++fn dx8_video_memory(_: &[Value]) -> gml::Result<Value> {
++    Ok(1024.into())
++}
++
++fn dx8_transformvertex(args: &[Value]) -> gml::Result<Value> {
++    // Sin matriz de mundo: se devuelve el vértice tal cual.
++    Ok(arg(args, 0).into())
++}
++
++// ---- GMFMODSimple ----
++
++fn fmod_sound_add(game: &mut Game, args: &[Value]) -> gml::Result<Value> {
++    let name: gml::String = args.get(0).cloned().unwrap_or_default().into();
++    let name = game.decode_str(name.as_ref()).into_owned();
++    let path = gml::file::to_path(&name);
++    match std::fs::read(path.as_ref()) {
++        Ok(bytes) => Ok(game.fmod.sound_add(bytes, &path).into()),
++        Err(_) => Ok(0.into()),
++    }
++}
++
++macro_rules! fmod_fn {
++    ($name: ident, |$f: ident, $a: ident| $body: expr) => {
++        fn $name(game: &mut Game, args: &[Value]) -> gml::Result<Value> {
++            let $f = &mut game.fmod;
++            let $a = |i| arg(args, i);
++            Ok(Value::from($body))
++        }
++    };
++}
++
++fmod_fn!(fmod_sound_free, |f, a| f.sound_free(a(0)));
++fmod_fn!(fmod_sound_get_length, |f, a| f.sound_get_length(a(0)));
++fmod_fn!(fmod_sound_set_loop_points, |f, a| f.sound_set_loop_points(a(0), a(1), a(2)));
++fmod_fn!(fmod_sound_set_max_volume, |f, a| f.sound_set_max_volume(a(0), a(1)));
++fmod_fn!(fmod_sound_set_group, |f, a| f.sound_set_group(a(0), a(1)));
++fmod_fn!(fmod_sound_play, |f, a| f.sound_play(a(0), a(1) >= 0.5, false));
++fmod_fn!(fmod_sound_loop, |f, a| f.sound_play(a(0), a(1) >= 0.5, true));
++fmod_fn!(fmod_instance_stop, |f, a| f.instance_stop(a(0)));
++fmod_fn!(fmod_instance_is_playing, |f, a| f.instance_is_playing(a(0)));
++fmod_fn!(fmod_instance_set_paused, |f, a| f.instance_set_paused(a(0), a(1) >= 0.5));
++fmod_fn!(fmod_instance_set_volume, |f, a| f.instance_set_volume(a(0), a(1)));
++fmod_fn!(fmod_instance_set_pitch, |f, a| f.instance_set_pitch(a(0), a(1)));
++fmod_fn!(fmod_instance_get_position, |f, a| f.instance_get_position(a(0)));
++fmod_fn!(fmod_instance_set_position, |f, a| f.instance_set_position(a(0), a(1)));
++fmod_fn!(fmod_group_set_volume, |f, a| f.group_set_volume(a(0), a(1)));
++fmod_fn!(fmod_group_set_pitch, |f, a| f.group_set_pitch(a(0), a(1)));
++fmod_fn!(fmod_master_set_volume, |f, a| f.master_set_volume(a(0)));
++fmod_fn!(fmod_all_stop, |f, _a| f.all_stop());
++fmod_fn!(fmod_free, |f, _a| f.free());
++
++fn lookup(dll: &str, symbol: &str) -> Option<Function> {
++    Some(match (dll, symbol) {
++        ("gm82core.dll", "__gm82core_dllcheck") => Function::Pure(ret_820),
++        // Siempre "primera vez": game_restart no pierde memoria en el emulador.
++        ("gm82core.dll", "__gm82core_checkstart") => Function::Pure(ret_1),
++        ("gm82core.dll", "__hrt_init") => Function::Pure(ret_1),
++        ("gm82core.dll", "hrt_now") => Function::Volatile(hrt_now),
++        ("gm82core.dll", "get_foreground_window") => Function::Pure(ret_1),
++        ("gm82core.dll", "approach") => Function::Pure(approach),
++        ("gm82core.dll", "dsin") => Function::Pure(gm82_dsin),
++        ("gm82core.dll", "dcos") => Function::Pure(gm82_dcos),
++        ("gm82core.dll", "in_range") => Function::Pure(in_range),
++        ("gm82core.dll", "pivot_pos_x") => Function::Pure(pivot_pos_x),
++        ("gm82core.dll", "pivot_pos_y") => Function::Pure(pivot_pos_y),
++        ("gm82core.dll", "get_windows_version") => Function::Pure(get_windows_version),
++        ("gm82core.dll", "io_get_language") => Function::Volatile(|_, a| io_get_language(a)),
++        ("gm82core.dll", "get_window_col") => Function::Pure(get_window_col),
++
++        ("gm82dx8.dll", "__gm82dx8_dllcheck") => Function::Pure(ret_820),
++        // 0 = no había arrancado, así que la inicialización sigue.
++        ("gm82dx8.dll", "__gm82dx8_checkstart") => Function::Pure(ret_0),
++        // 0 = Windows XP: desactiva el vsync propio de la extensión; el emulador marca el ritmo.
++        ("gm82dx8.dll", "__gm82dx8_not_xp") => Function::Pure(ret_0),
++        ("gm82dx8.dll", "__gm82dx8_waitvblank") => Function::Pure(ret_1),
++        ("gm82dx8.dll", "__gm82dx8_time_now") => Function::Volatile(hrt_now),
++        ("gm82dx8.dll", "__gm82dx8_transformvertex") => Function::Pure(dx8_transformvertex),
++        ("gm82dx8.dll", "__gm82dx8_getmaxwidth") => Function::Volatile(dx8_max_texture_size),
++        ("gm82dx8.dll", "__gm82dx8_getmaxheight") => Function::Volatile(dx8_max_texture_size),
++        ("gm82dx8.dll", "__gm82dx8_getvideomem") => Function::Pure(dx8_video_memory),
++
++        ("sdl2.dll", "SDL_GetError") => Function::Pure(ret_empty),
++
++        ("gmfmodsimple.dll", "FMODinit") => Function::Pure(ret_1),
++        ("gmfmodsimple.dll", "FMODUpdate") => Function::Pure(ret_1),
++        ("gmfmodsimple.dll", "FMODfree") => Function::Engine(fmod_free),
++        ("gmfmodsimple.dll", "FMODAllStop") => Function::Engine(fmod_all_stop),
++        ("gmfmodsimple.dll", "FMODSoundAdd") => Function::Engine(fmod_sound_add),
++        ("gmfmodsimple.dll", "FMODSoundFree") => Function::Engine(fmod_sound_free),
++        ("gmfmodsimple.dll", "FMODSoundGetLength") => Function::Engine(fmod_sound_get_length),
++        ("gmfmodsimple.dll", "FMODSoundSetLoopPoints") => Function::Engine(fmod_sound_set_loop_points),
++        ("gmfmodsimple.dll", "FMODSoundSetMaxVolume") => Function::Engine(fmod_sound_set_max_volume),
++        ("gmfmodsimple.dll", "FMODSoundSetGroup") => Function::Engine(fmod_sound_set_group),
++        ("gmfmodsimple.dll", "FMODSoundPlay") => Function::Engine(fmod_sound_play),
++        ("gmfmodsimple.dll", "FMODSoundLoop") => Function::Engine(fmod_sound_loop),
++        ("gmfmodsimple.dll", "FMODInstanceStop") => Function::Engine(fmod_instance_stop),
++        ("gmfmodsimple.dll", "FMODInstanceIsPlaying") => Function::Engine(fmod_instance_is_playing),
++        ("gmfmodsimple.dll", "FMODInstanceSetPaused") => Function::Engine(fmod_instance_set_paused),
++        ("gmfmodsimple.dll", "FMODInstanceSetVolume") => Function::Engine(fmod_instance_set_volume),
++        ("gmfmodsimple.dll", "FMODInstanceSetPitch") => Function::Engine(fmod_instance_set_pitch),
++        ("gmfmodsimple.dll", "FMODInstanceGetPosition") => Function::Engine(fmod_instance_get_position),
++        ("gmfmodsimple.dll", "FMODInstanceSetPosition") => Function::Engine(fmod_instance_set_position),
++        ("gmfmodsimple.dll", "FMODGroupSetVolume") => Function::Engine(fmod_group_set_volume),
++        ("gmfmodsimple.dll", "FMODGroupSetPitch") => Function::Engine(fmod_group_set_pitch),
++        ("gmfmodsimple.dll", "FMODMasterSetVolume") => Function::Engine(fmod_master_set_volume),
++
++        _ => return None,
++    })
++}
++
++/// DLL que se emulan por completo: cualquier símbolo suyo se resuelve aquí, aunque no esté en la tabla.
++const KNOWN_DLLS: &[&str] = &["gm82core.dll", "gm82dx8.dll", "gm82joy.dll", "sdl2.dll", "gmfmodsimple.dll", "fmodex.dll"];
++
++pub enum Emulation {
++    Function(Function),
++    Missing(Value),
++}
++
++/// Avisa por stdout la primera vez que el juego llama una función emulada que falta.
++pub fn report_missing(signature: &ExternalSignature) {
++    use std::{collections::HashSet, sync::Mutex};
++    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
++    let name = format!("{}!{}", dll_basename(&signature.dll), signature.symbol);
++    if let Ok(mut seen) = SEEN.lock() {
++        if seen.get_or_insert_with(HashSet::new).insert(name.clone()) {
++            println!("DLL emulada: se llamó {}, que no está implementada; devuelve un valor vacío", name);
++        }
++    }
++}
++
++/// Busca una reimplementación para la firma. `None` si la DLL no es conocida.
++pub fn find(signature: &ExternalSignature) -> Option<Emulation> {
++    let dll = dll_basename(&signature.dll);
++    if !KNOWN_DLLS.contains(&dll.as_str()) {
++        return None
++    }
++    Some(match lookup(&dll, &signature.symbol) {
++        Some(f) => Emulation::Function(f),
++        None => Emulation::Missing(match signature.type_return {
++            ValueType::Real => 0.into(),
++            ValueType::Str => "".into(),
++        }),
++    })
++}
+diff --git a/gm8emulator/src/game/external/fmod.rs b/gm8emulator/src/game/external/fmod.rs
+new file mode 100644
+index 0000000..d0e2fcd
+--- /dev/null
++++ b/gm8emulator/src/game/external/fmod.rs
+@@ -0,0 +1,713 @@
++//! Reimplementación de GMFMODSimple.dll (FMOD Ex para GameMaker).
++//!
++//! El estado avanza con el reloj lógico del juego: cada paso consume exactamente `RATE / room_speed`
++//! muestras, así que lo que la lógica puede leer (si una instancia sigue sonando, su posición) es igual con
++//! audio o sin él, en cualquier máquina. La mezcla es opcional: si hay una salida conectada, cada paso deja
++//! su bloque de audio estéreo a 44,1 kHz en una cola que el backend de audio de la plataforma consume.
++//!
++//! Formatos: OGG Vorbis (decodificado en streaming por instancia) y WAV PCM/float (decodificado entero al
++//! cargar). Los efectos DSP de FMOD no se implementan: se aceptan y no hacen nada.
++//!
++//! Unidades de GMFMODSimple: volúmenes y pitch lineales (1 = normal), longitud en milisegundos, posiciones
++//! y puntos de loop como fracción de la duración (0 a 1).
++//!
++//! Savestates: `save_state` guarda los parámetros de sonidos e instancias, no el audio. Al cargar, los datos
++//! salen del caché de esta sesión o se vuelven a leer del archivo de origen.
++
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::{BTreeMap, HashMap, VecDeque},
++    io::Cursor,
++    sync::{Arc, Mutex},
++};
++
++/// Frecuencia de la mezcla.
++pub const RATE: u32 = 44100;
++
++/// Máximo de audio pendiente en la cola de salida antes de descartar lo más viejo (en muestras estéreo).
++const MAX_QUEUED_FRAMES: usize = RATE as usize / 4;
++
++pub type OutputQueue = Arc<Mutex<VecDeque<f32>>>;
++
++enum Data {
++    Pcm { rate: u32, frames: Vec<[f32; 2]> },
++    Ogg { rate: u32, bytes: Arc<[u8]>, length: u64 },
++}
++
++impl Data {
++    fn rate(&self) -> u32 {
++        match self {
++            Data::Pcm { rate, .. } | Data::Ogg { rate, .. } => *rate,
++        }
++    }
++
++    fn length(&self) -> u64 {
++        match self {
++            Data::Pcm { frames, .. } => frames.len() as u64,
++            Data::Ogg { length, .. } => *length,
++        }
++    }
++}
++
++struct Sound {
++    /// Ruta de origen: identifica los datos en el caché y permite releerlos al cargar un savestate.
++    key: String,
++    data: Arc<Data>,
++    group: usize,
++    max_volume: f64,
++    loop_start: f64,
++    loop_end: f64,
++}
++
++struct Instance {
++    sound: usize,
++    data: Arc<Data>,
++    pos: f64,
++    pitch: f64,
++    volume: f64,
++    paused: bool,
++    looping: bool,
++    stream: Option<OggStream>,
++}
++
++#[derive(Clone, Copy, Serialize, Deserialize)]
++struct Group {
++    volume: f64,
++    pitch: f64,
++}
++
++pub struct Fmod {
++    sounds: Vec<Option<Sound>>,
++    instances: BTreeMap<u32, Instance>,
++    next_instance: u32,
++    groups: [Group; 5],
++    master_volume: f64,
++    output: Option<OutputQueue>,
++    sample_acc: f64,
++    mix: Vec<[f32; 2]>,
++    /// Audio ya decodificado por ruta. No forma parte del estado: solo evita releer archivos al cargar.
++    library: HashMap<String, Arc<Data>>,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++struct SoundState {
++    key: String,
++    group: usize,
++    max_volume: f64,
++    loop_start: f64,
++    loop_end: f64,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++struct InstanceState {
++    handle: u32,
++    sound: usize,
++    pos: f64,
++    pitch: f64,
++    volume: f64,
++    paused: bool,
++    looping: bool,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++pub struct FmodState {
++    sounds: Vec<Option<SoundState>>,
++    instances: Vec<InstanceState>,
++    next_instance: u32,
++    groups: [Group; 5],
++    master_volume: f64,
++    sample_acc: f64,
++}
++
++impl Default for Fmod {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Fmod {
++    pub fn new() -> Self {
++        Self {
++            sounds: Vec::new(),
++            instances: BTreeMap::new(),
++            next_instance: 1,
++            groups: [Group { volume: 1.0, pitch: 1.0 }; 5],
++            master_volume: 1.0,
++            output: None,
++            sample_acc: 0.0,
++            mix: Vec::new(),
++            library: HashMap::new(),
++        }
++    }
++
++    pub fn save_state(&self) -> FmodState {
++        FmodState {
++            sounds: self
++                .sounds
++                .iter()
++                .map(|s| {
++                    s.as_ref().map(|s| SoundState {
++                        key: s.key.clone(),
++                        group: s.group,
++                        max_volume: s.max_volume,
++                        loop_start: s.loop_start,
++                        loop_end: s.loop_end,
++                    })
++                })
++                .collect(),
++            instances: self
++                .instances
++                .iter()
++                .map(|(&handle, i)| InstanceState {
++                    handle,
++                    sound: i.sound,
++                    pos: i.pos,
++                    pitch: i.pitch,
++                    volume: i.volume,
++                    paused: i.paused,
++                    looping: i.looping,
++                })
++                .collect(),
++            next_instance: self.next_instance,
++            groups: self.groups,
++            master_volume: self.master_volume,
++            sample_acc: self.sample_acc,
++        }
++    }
++
++    pub fn load_state(&mut self, state: FmodState) {
++        let mut sounds = Vec::with_capacity(state.sounds.len());
++        for s in state.sounds {
++            sounds.push(s.and_then(|s| {
++                let data = self.load_data(&s.key)?;
++                Some(Sound {
++                    key: s.key,
++                    data,
++                    group: s.group,
++                    max_volume: s.max_volume,
++                    loop_start: s.loop_start,
++                    loop_end: s.loop_end,
++                })
++            }));
++        }
++        let mut old = std::mem::take(&mut self.instances);
++        for i in state.instances {
++            let Some(sound) = sounds.get(i.sound).and_then(Option::as_ref) else { continue };
++            let data = sound.data.clone();
++            // El decodificador es solo un caché de posición: si la instancia sigue viva con los mismos datos,
++            // se reutiliza para no decodificar desde el principio.
++            let stream = match old.remove(&i.handle) {
++                Some(o) if Arc::ptr_eq(&o.data, &data) => o.stream,
++                _ => OggStream::new(&data),
++            };
++            self.instances.insert(i.handle, Instance {
++                sound: i.sound,
++                data,
++                pos: i.pos,
++                pitch: i.pitch,
++                volume: i.volume,
++                paused: i.paused,
++                looping: i.looping,
++                stream,
++            });
++        }
++        self.sounds = sounds;
++        self.next_instance = state.next_instance;
++        self.groups = state.groups;
++        self.master_volume = state.master_volume;
++        self.sample_acc = state.sample_acc;
++        if let Some(q) = &self.output {
++            if let Ok(mut q) = q.lock() {
++                q.clear();
++            }
++        }
++    }
++
++    fn load_data(&mut self, key: &str) -> Option<Arc<Data>> {
++        if let Some(d) = self.library.get(key) {
++            return Some(d.clone())
++        }
++        match std::fs::read(key).map_err(|e| e.to_string()).and_then(decode) {
++            Ok(d) => {
++                let d = Arc::new(d);
++                self.library.insert(key.to_string(), d.clone());
++                Some(d)
++            },
++            Err(e) => {
++                println!("WARNING (FMOD): al cargar el savestate no se pudo releer {}: {}", key, e);
++                None
++            },
++        }
++    }
++
++    /// Conecta la cola de la que lee el backend de audio. Sin salida, el estado avanza igual pero no se mezcla.
++    pub fn set_output(&mut self, output: Option<OutputQueue>) {
++        self.output = output;
++    }
++
++    fn sound(&self, id: f64) -> Option<&Sound> {
++        let i = (id as i64).checked_sub(1)?;
++        self.sounds.get(usize::try_from(i).ok()?)?.as_ref()
++    }
++
++    fn sound_mut(&mut self, id: f64) -> Option<&mut Sound> {
++        let i = (id as i64).checked_sub(1)?;
++        self.sounds.get_mut(usize::try_from(i).ok()?)?.as_mut()
++    }
++
++    fn instance_mut(&mut self, id: f64) -> Option<&mut Instance> {
++        self.instances.get_mut(&u32::try_from(id as i64).ok()?)
++    }
++
++    /// FMODSoundAdd: devuelve el id del sonido, o 0 si no se pudo cargar. `key` es la ruta de origen.
++    pub fn sound_add(&mut self, bytes: Vec<u8>, key: &str) -> f64 {
++        let data = match decode(bytes) {
++            Ok(d) => Arc::new(d),
++            Err(e) => {
++                println!("WARNING (FMOD): no se pudo cargar {}: {}", key, e);
++                return 0.0
++            },
++        };
++        self.library.insert(key.to_string(), data.clone());
++        let sound = Sound { key: key.to_string(), data, group: 0, max_volume: 1.0, loop_start: 0.0, loop_end: 1.0 };
++        if let Some(i) = self.sounds.iter().position(Option::is_none) {
++            self.sounds[i] = Some(sound);
++            (i + 1) as f64
++        } else {
++            self.sounds.push(Some(sound));
++            self.sounds.len() as f64
++        }
++    }
++
++    pub fn sound_free(&mut self, id: f64) -> f64 {
++        let i = id as i64 - 1;
++        if self.sound(id).is_none() {
++            return 0.0
++        }
++        self.instances.retain(|_, inst| inst.sound as i64 != i);
++        self.sounds[i as usize] = None;
++        1.0
++    }
++
++    /// Duración en milisegundos.
++    pub fn sound_get_length(&self, id: f64) -> f64 {
++        self.sound(id).map(|s| s.data.length() as f64 * 1000.0 / s.data.rate() as f64).unwrap_or(0.0)
++    }
++
++    pub fn sound_set_loop_points(&mut self, id: f64, start: f64, end: f64) -> f64 {
++        match self.sound_mut(id) {
++            Some(s) => {
++                s.loop_start = start.clamp(0.0, 1.0);
++                s.loop_end = end.clamp(0.0, 1.0);
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    pub fn sound_set_max_volume(&mut self, id: f64, volume: f64) -> f64 {
++        match self.sound_mut(id) {
++            Some(s) => {
++                s.max_volume = volume.clamp(0.0, 1.0);
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    pub fn sound_set_group(&mut self, id: f64, group: f64) -> f64 {
++        let group = (group as i64).clamp(0, 4) as usize;
++        match self.sound_mut(id) {
++            Some(s) => {
++                s.group = group;
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    /// FMODSoundPlay / FMODSoundLoop: devuelve el id de la instancia, o 0.
++    pub fn sound_play(&mut self, id: f64, paused: bool, looping: bool) -> f64 {
++        let Some(sound) = self.sound(id) else { return 0.0 };
++        let data = sound.data.clone();
++        let instance = Instance {
++            sound: id as usize - 1,
++            stream: matches!(*data, Data::Ogg { .. }).then(|| OggStream::new(&data)).flatten(),
++            data,
++            pos: 0.0,
++            pitch: 1.0,
++            volume: 1.0,
++            paused,
++            looping,
++        };
++        let handle = self.next_instance;
++        self.next_instance = self.next_instance.wrapping_add(1).max(1);
++        self.instances.insert(handle, instance);
++        handle as f64
++    }
++
++    pub fn instance_stop(&mut self, id: f64) -> f64 {
++        self.instances.remove(&(id as i64 as u32)).is_some() as u8 as f64
++    }
++
++    pub fn instance_is_playing(&self, id: f64) -> f64 {
++        u32::try_from(id as i64).ok().map(|h| self.instances.contains_key(&h)).unwrap_or(false) as u8 as f64
++    }
++
++    pub fn instance_set_paused(&mut self, id: f64, paused: bool) -> f64 {
++        match self.instance_mut(id) {
++            Some(i) => {
++                i.paused = paused;
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    pub fn instance_set_volume(&mut self, id: f64, volume: f64) -> f64 {
++        match self.instance_mut(id) {
++            Some(i) => {
++                i.volume = volume.clamp(0.0, 1.0);
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    pub fn instance_set_pitch(&mut self, id: f64, pitch: f64) -> f64 {
++        match self.instance_mut(id) {
++            Some(i) => {
++                i.pitch = pitch.clamp(0.0, 10.0);
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    /// Posición como fracción de la duración.
++    pub fn instance_get_position(&self, id: f64) -> f64 {
++        u32::try_from(id as i64)
++            .ok()
++            .and_then(|h| self.instances.get(&h))
++            .map(|i| i.pos / i.data.length().max(1) as f64)
++            .unwrap_or(0.0)
++    }
++
++    pub fn instance_set_position(&mut self, id: f64, position: f64) -> f64 {
++        match self.instance_mut(id) {
++            Some(i) => {
++                i.pos = position.clamp(0.0, 1.0) * i.data.length() as f64;
++                1.0
++            },
++            None => 0.0,
++        }
++    }
++
++    pub fn group_set_volume(&mut self, group: f64, volume: f64) -> f64 {
++        let g = (group as i64).clamp(0, 4) as usize;
++        self.groups[g].volume = volume.clamp(0.0, 1.0);
++        1.0
++    }
++
++    pub fn group_set_pitch(&mut self, group: f64, pitch: f64) -> f64 {
++        let g = (group as i64).clamp(0, 4) as usize;
++        self.groups[g].pitch = pitch.clamp(0.0, 10.0);
++        1.0
++    }
++
++    pub fn master_set_volume(&mut self, volume: f64) -> f64 {
++        self.master_volume = volume.clamp(0.0, 1.0);
++        1.0
++    }
++
++    pub fn all_stop(&mut self) -> f64 {
++        self.instances.clear();
++        1.0
++    }
++
++    /// FMODfree: libera todo.
++    pub fn free(&mut self) -> f64 {
++        self.instances.clear();
++        self.sounds.clear();
++        1.0
++    }
++
++    /// Avanza un paso del juego. Siempre recorre las muestras una por una para que la posición resultante
++    /// sea idéntica con y sin mezcla.
++    pub fn step(&mut self, room_speed: u32) {
++        self.sample_acc += RATE as f64 / room_speed.max(1) as f64;
++        let n = self.sample_acc as usize;
++        self.sample_acc -= n as f64;
++
++        let mixing = self.output.is_some();
++        if mixing {
++            self.mix.clear();
++            self.mix.resize(n, [0.0; 2]);
++        }
++
++        let master_pitch = self.groups[0].pitch;
++        let master_volume = self.master_volume * self.groups[0].volume;
++        let mut finished = Vec::new();
++        for (&handle, inst) in self.instances.iter_mut() {
++            if inst.paused {
++                continue
++            }
++            let Some(sound) = self.sounds.get(inst.sound).and_then(Option::as_ref) else {
++                finished.push(handle);
++                continue
++            };
++            let group = self.groups[sound.group];
++            let length = inst.data.length() as f64;
++            let ratio = inst.data.rate() as f64 / RATE as f64 * inst.pitch * group.pitch * master_pitch;
++            let (loop_start, loop_end) = {
++                let (a, b) = (sound.loop_start * length, sound.loop_end * length);
++                if b > a { (a, b) } else { (0.0, length) }
++            };
++            let gain = (sound.max_volume * inst.volume * group.volume * master_volume) as f32;
++
++            for out in 0..n {
++                if !inst.looping && inst.pos >= length {
++                    finished.push(handle);
++                    break
++                }
++                if mixing && gain > 0.0 {
++                    let [l, r] = sample_at(inst, inst.pos);
++                    let m = &mut self.mix[out];
++                    m[0] += l * gain;
++                    m[1] += r * gain;
++                }
++                inst.pos += ratio;
++                if inst.looping && inst.pos >= loop_end {
++                    inst.pos = loop_start + (inst.pos - loop_end) % (loop_end - loop_start);
++                }
++            }
++            // Un sonido sin loop que justo terminó en este paso deja de sonar ahora, no en el siguiente.
++            if !inst.looping && inst.pos >= length && finished.last() != Some(&handle) {
++                finished.push(handle);
++            }
++        }
++        for h in finished {
++            self.instances.remove(&h);
++        }
++
++        if let Some(out) = &self.output {
++            if let Ok(mut q) = out.lock() {
++                q.extend(self.mix.iter().flat_map(|[l, r]| [l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0)]));
++                let excess = q.len().saturating_sub(MAX_QUEUED_FRAMES * 2);
++                q.drain(..excess);
++            }
++        }
++    }
++}
++
++/// Muestra en la posición `pos` (en cuadros de la fuente), con interpolación lineal.
++fn sample_at(inst: &mut Instance, pos: f64) -> [f32; 2] {
++    let i = pos as u64;
++    let t = (pos - i as f64) as f32;
++    let (a, b) = match &*inst.data {
++        Data::Pcm { frames, .. } => {
++            let a = frames.get(i as usize).copied().unwrap_or([0.0; 2]);
++            let b = frames.get(i as usize + 1).copied().unwrap_or(a);
++            (a, b)
++        },
++        Data::Ogg { .. } => match &mut inst.stream {
++            Some(s) => {
++                let a = s.get(i);
++                (a, s.get(i + 1))
++            },
++            None => ([0.0; 2], [0.0; 2]),
++        },
++    };
++    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
++}
++
++/// Decodificador OGG por instancia. Guarda una ventana de cuadros decodificados; para retroceder (loop,
++/// cambio de posición) vuelve a empezar desde el principio del archivo.
++struct OggStream {
++    bytes: Arc<[u8]>,
++    reader: lewton::inside_ogg::OggStreamReader<Cursor<Arc<[u8]>>>,
++    buf: VecDeque<[f32; 2]>,
++    buf_start: u64,
++    ended: bool,
++}
++
++impl OggStream {
++    fn new(data: &Data) -> Option<Self> {
++        let Data::Ogg { bytes, .. } = data else { return None };
++        let reader = lewton::inside_ogg::OggStreamReader::new(Cursor::new(bytes.clone())).ok()?;
++        Some(Self { bytes: bytes.clone(), reader, buf: VecDeque::new(), buf_start: 0, ended: false })
++    }
++
++    fn rewind(&mut self) {
++        if let Ok(r) = lewton::inside_ogg::OggStreamReader::new(Cursor::new(self.bytes.clone())) {
++            self.reader = r;
++        }
++        self.buf.clear();
++        self.buf_start = 0;
++        self.ended = false;
++    }
++
++    fn get(&mut self, frame: u64) -> [f32; 2] {
++        if frame < self.buf_start {
++            self.rewind();
++        }
++        while frame >= self.buf_start + self.buf.len() as u64 {
++            if self.ended {
++                return [0.0; 2]
++            }
++            // Conservar solo el último cuadro (para interpolar) al avanzar mucho.
++            if self.buf.len() > 8192 {
++                let drop = self.buf.len() - 1;
++                self.buf.drain(..drop);
++                self.buf_start += drop as u64;
++            }
++            let channels = self.reader.ident_hdr.audio_channels as usize;
++            match self.reader.read_dec_packet_itl() {
++                Ok(Some(pcm)) => {
++                    for c in pcm.chunks_exact(channels.max(1)) {
++                        let l = c[0] as f32 / 32768.0;
++                        let r = c.get(1).map(|&x| x as f32 / 32768.0).unwrap_or(l);
++                        self.buf.push_back([l, r]);
++                    }
++                },
++                _ => self.ended = true,
++            }
++        }
++        self.buf[(frame - self.buf_start) as usize]
++    }
++}
++
++fn decode(bytes: Vec<u8>) -> Result<Data, String> {
++    if bytes.starts_with(b"OggS") {
++        let bytes: Arc<[u8]> = bytes.into();
++        let reader = lewton::inside_ogg::OggStreamReader::new(Cursor::new(bytes.clone())).map_err(|e| e.to_string())?;
++        let rate = reader.ident_hdr.audio_sample_rate;
++        let length = ogg_length(&bytes).ok_or("no se encontró la última página OGG")?;
++        Ok(Data::Ogg { rate, bytes, length })
++    } else if bytes.starts_with(b"RIFF") {
++        let mut reader = hound::WavReader::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
++        let spec = reader.spec();
++        let samples: Vec<f32> = match spec.sample_format {
++            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
++            hound::SampleFormat::Int => {
++                let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
++                reader.samples::<i32>().filter_map(Result::ok).map(|s| s as f32 * scale).collect()
++            },
++        };
++        let channels = spec.channels.max(1) as usize;
++        let frames = samples
++            .chunks_exact(channels)
++            .map(|c| [c[0], c.get(1).copied().unwrap_or(c[0])])
++            .collect();
++        Ok(Data::Pcm { rate: spec.sample_rate, frames })
++    } else {
++        Err("formato no soportado (solo OGG y WAV)".into())
++    }
++}
++
++/// Cantidad de cuadros de un OGG Vorbis: la posición de gránulo de la última página.
++fn ogg_length(bytes: &[u8]) -> Option<u64> {
++    let start = bytes.len().saturating_sub(65536);
++    let tail = &bytes[start..];
++    let p = tail.windows(4).rposition(|w| w == b"OggS")?;
++    let gp = tail.get(p + 6..p + 14)?;
++    Some(u64::from_le_bytes(gp.try_into().ok()?))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Mezcla 3 s de un OGG o WAV real con loop. Uso:
++    /// `FMOD_TEST_FILE=archivo.ogg [FMOD_TEST_OUT=salida.wav] cargo test -p gm8emulator fmod -- --nocapture`
++    #[test]
++    fn mezcla_archivo_real() {
++        let Ok(path) = std::env::var("FMOD_TEST_FILE") else { return };
++        let queue: OutputQueue = Default::default();
++        let mut fmod = Fmod::new();
++        fmod.set_output(Some(queue.clone()));
++        let snd = fmod.sound_add(std::fs::read(&path).unwrap(), &path);
++        assert!(snd > 0.0);
++        let len_ms = fmod.sound_get_length(snd);
++        // loop entre el 10% y el 10% + 1 s, para pasar al menos dos veces por el punto de loop
++        fmod.sound_set_loop_points(snd, 0.1, 0.1 + 1000.0 / len_ms);
++        let inst = fmod.sound_play(snd, false, true);
++        fmod.instance_set_position(inst, 0.1);
++        let mut out = Vec::new();
++        for _ in 0..150 {
++            fmod.step(50);
++            out.extend(queue.lock().unwrap().drain(..));
++        }
++        assert_eq!(out.len(), 3 * RATE as usize * 2);
++        assert_eq!(fmod.instance_is_playing(inst), 1.0);
++        let rms = (out.iter().map(|s| (s * s) as f64).sum::<f64>() / out.len() as f64).sqrt();
++        println!("duración {:.0} ms, rms {:.4}, posición {:.4}", len_ms, rms, fmod.instance_get_position(inst));
++        assert!(rms > 0.001);
++        let pos = fmod.instance_get_position(inst);
++        assert!(pos >= 0.1 && pos < 0.1 + 1000.0 / len_ms, "posición fuera del loop: {}", pos);
++        if let Ok(o) = std::env::var("FMOD_TEST_OUT") {
++            let spec = hound::WavSpec { channels: 2, sample_rate: RATE, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
++            let mut w = hound::WavWriter::create(o, spec).unwrap();
++            for s in out {
++                w.write_sample((s * 32767.0) as i16).unwrap();
++            }
++            w.finalize().unwrap();
++        }
++    }
++
++    #[test]
++    fn instancia_termina_a_tiempo() {
++        // 1 s de silencio a 22050 Hz, pitch 2: debe durar 0,5 s = 25 pasos a 50 fps.
++        let mut wav = Vec::new();
++        {
++            let spec = hound::WavSpec { channels: 1, sample_rate: 22050, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
++            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut wav), spec).unwrap();
++            for _ in 0..22050 {
++                w.write_sample(0i16).unwrap();
++            }
++            w.finalize().unwrap();
++        }
++        let mut fmod = Fmod::new();
++        let snd = fmod.sound_add(wav, "prueba");
++        assert_eq!(fmod.sound_get_length(snd), 1000.0);
++        let inst = fmod.sound_play(snd, false, false);
++        fmod.instance_set_pitch(inst, 2.0);
++        for _ in 0..24 {
++            fmod.step(50);
++        }
++        assert_eq!(fmod.instance_is_playing(inst), 1.0);
++        fmod.step(50);
++        fmod.step(50);
++        assert_eq!(fmod.instance_is_playing(inst), 0.0);
++    }
++
++    #[test]
++    fn savestate_vuelve_atras() {
++        let mut wav = Vec::new();
++        {
++            let spec = hound::WavSpec { channels: 1, sample_rate: 44100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
++            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut wav), spec).unwrap();
++            for i in 0..44100 {
++                w.write_sample((i % 1000) as i16).unwrap();
++            }
++            w.finalize().unwrap();
++        }
++        let mut fmod = Fmod::new();
++        let snd = fmod.sound_add(wav, "prueba");
++        let inst = fmod.sound_play(snd, false, false);
++        for _ in 0..10 {
++            fmod.step(50);
++        }
++        let state = fmod.save_state();
++        let pos = fmod.instance_get_position(inst);
++        for _ in 0..45 {
++            fmod.step(50);
++        }
++        assert_eq!(fmod.instance_is_playing(inst), 0.0);
++        fmod.load_state(state);
++        assert_eq!(fmod.instance_is_playing(inst), 1.0);
++        assert_eq!(fmod.instance_get_position(inst), pos);
++        // Un sonido nuevo no reutiliza el handle de la instancia restaurada.
++        assert_ne!(fmod.sound_play(snd, false, false), inst);
++    }
++}
+diff --git a/gm8emulator/src/game/rl.rs b/gm8emulator/src/game/rl.rs
+new file mode 100644
+index 0000000..a767f5a
+--- /dev/null
++++ b/gm8emulator/src/game/rl.rs
+@@ -0,0 +1,381 @@
++//! Frame-by-frame control of the game by an external reinforcement learning client.
++//!
++//! The emulator listens on a Unix socket and serves one client. Every request starts with a one-byte
++//! opcode; all integers are little-endian. stdout is left alone since the emulator logs there.
++//!
++//! | op | request                                        | response                                                   |
++//! |----|------------------------------------------------|------------------------------------------------------------|
++//! | 1  | STEP: u8 n, n x u8 vk held, u32 frames, u8 fl  | u8 status, i32 room, u64 frame, [obs]                      |
++//! | 2  | SAVE: u32 slot                                 | u8 status                                                  |
++//! | 3  | LOAD: u32 slot                                 | u8 status                                                  |
++//! | 4  | OBS                                            | obs                                                        |
++//! | 5  | QUERY: u16 len, object name                    | u32 n, n x (i32 id, f64 x, f64 y, f64 hspeed, f64 vspeed)  |
++//! | 6  | INFO                                           | i32 room, u32 w, u32 h, u32 speed, u16 len, name, u64 frame |
++//! | 7  | EXEC: u32 len, GML code                        | u8 status, [u16 len, error] or value                      |
++//! | 8  | TRACK: u16 len, object name                    | u8 status (0 = ok, 2 = no such object)                     |
++//! | 255| QUIT                                           | (none)                                                     |
++//!
++//! `obs` is `u32 width, u32 height, width*height*3 bytes RGB, top row first`.
++//! STEP status: 0 = ok, 1 = the game ended (it is restarted), 2 = runtime error followed by `u16 len, message`.
++//! STEP flags: bit 0 = send obs, bit 1 = skip drawing all but the last frame (faster, but draw events don't run),
++//! bit 2 = send a trace of the tracked object, bit 3 = don't draw any frame (not even the last one),
++//! bit 4 = stop early when the tracked object has no instance left (e.g. the player died).
++//! The trace follows the obs: `u32 n` and one record per frame run, `i32 room, u8 alive, f32 x, f32 y,
++//! i32 sprite_index, f32 image_index, f32 image_xscale` (the first active instance of the tracked object).
++//! Holding keys is level-triggered: keys absent from a STEP are released before it runs.
++//! EXEC runs the code like room creation code (as a dummy instance, `global.` and `with` work) and applies any
++//! room change it requests right away. `value` is `u8 0, f64` for reals or `u8 1, u16 len, bytes` for strings.
++
++use crate::{
++    game::{replay::Replay, savestate::SaveState, Game, GameClock, GetAsset, SceneChange},
++    gml::{Context, Value},
++    instance::{Instance, InstanceState},
++};
++use byteorder::{ReadBytesExt, WriteBytesExt, LE};
++use std::{
++    collections::{BTreeSet, HashMap},
++    io::{self, BufReader, BufWriter, Read, Write},
++    os::unix::net::UnixListener,
++    path::Path,
++    time::Duration,
++};
++
++const OP_STEP: u8 = 1;
++const OP_SAVE: u8 = 2;
++const OP_LOAD: u8 = 3;
++const OP_OBS: u8 = 4;
++const OP_QUERY: u8 = 5;
++const OP_INFO: u8 = 6;
++const OP_EXEC: u8 = 7;
++const OP_TRACK: u8 = 8;
++const OP_QUIT: u8 = 255;
++
++const STATUS_OK: u8 = 0;
++const STATUS_ENDED: u8 = 1;
++const STATUS_ERROR: u8 = 2;
++
++fn write_str(w: &mut impl Write, s: &[u8]) -> io::Result<()> {
++    let s = &s[..s.len().min(u16::MAX as usize)];
++    w.write_u16::<LE>(s.len() as u16)?;
++    w.write_all(s)
++}
++
++impl Game {
++    /// Runs one frame and any scene change it requested. Returns false if the game ended and was restarted.
++    fn rl_frame(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
++        self.input.mouse_step();
++        self.frame()?;
++        let running = self.rl_apply_scene_change()?;
++
++        if let GameClock::SpoofedNanos(t) = &mut self.clock {
++            *t += Duration::from_nanos(1_000_000_000 / u64::from(self.room.speed.max(1))).as_nanos();
++        }
++        self.fps = self.room.speed;
++        Ok(running)
++    }
++
++    /// Performs a pending room change/restart/load. Returns false if the game ended and was restarted.
++    fn rl_apply_scene_change(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
++        let mut running = true;
++        match self.scene_change {
++            Some(SceneChange::Room(id)) => self.load_room(id)?,
++            Some(SceneChange::Restart) => self.restart()?,
++            Some(SceneChange::End) => {
++                self.restart()?;
++                running = false;
++            },
++            Some(SceneChange::Load(ref mut path)) => {
++                let path = std::mem::take(path);
++                self.load_gm_save(path)?
++            },
++            None => (),
++        }
++        if self.close_requested {
++            self.close_requested = false;
++            self.restart()?;
++            running = false;
++        }
++        Ok(running)
++    }
++
++    fn rl_exec(&mut self, code: &[u8]) -> Result<Value, Box<dyn std::error::Error>> {
++        let instructions = self.compiler.compile(code)?;
++        let dummy = self
++            .room
++            .instance_list
++            .insert_dummy(Instance::new_dummy(self.assets.objects.get_asset(0).map(|x| x.as_ref())));
++        let mut context = Context::with_single_instance(dummy);
++        let result = self.execute(&instructions, &mut context);
++        self.room.instance_list.remove_dummy(dummy);
++        result?;
++        self.rl_apply_scene_change()?;
++        Ok(context.return_value)
++    }
++
++    fn rl_write_obs(&self, w: &mut impl Write) -> io::Result<()> {
++        let (width, height) = self.window_inner_size;
++        let rgba = self.renderer.get_pixels(0, 0, width as i32, height as i32);
++        w.write_u32::<LE>(width)?;
++        w.write_u32::<LE>(height)?;
++        // OpenGMK's framebuffer is already stored top row first
++        let mut row = vec![0u8; width as usize * 3];
++        for y in 0..height as usize {
++            let src = &rgba[y * width as usize * 4..(y + 1) * width as usize * 4];
++            for (dst, px) in row.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
++                dst.copy_from_slice(&px[..3]);
++            }
++            w.write_all(&row)?;
++        }
++        Ok(())
++    }
++
++    /// Trace record of the first active instance of an object: (alive, x, y, sprite, image_index, xscale).
++    fn rl_trace_record(&self, object_index: Option<i32>) -> (bool, f32, f32, i32, f32, f32) {
++        if let Some(object_index) = object_index {
++            let mut iter = self.room.instance_list.iter_by_identity(object_index);
++            while let Some(handle) = iter.next(&self.room.instance_list) {
++                let inst = self.room.instance_list.get(handle);
++                if inst.state.get() == InstanceState::Active {
++                    return (
++                        true,
++                        f64::from(inst.x.get()) as f32,
++                        f64::from(inst.y.get()) as f32,
++                        inst.sprite_index.get(),
++                        f64::from(inst.image_index.get()) as f32,
++                        f64::from(inst.image_xscale.get()) as f32,
++                    )
++                }
++            }
++        }
++        (false, 0.0, 0.0, -1, 0.0, 0.0)
++    }
++
++    fn rl_object_index(&self, name: &[u8]) -> Option<i32> {
++        self.assets.objects.iter().position(|o| o.as_ref().map_or(false, |o| o.name.as_ref() == name)).map(|i| i as i32)
++    }
++
++    /// Serves an RL client on the given Unix socket until it sends QUIT or disconnects.
++    pub fn rl_server(mut self, socket_path: &Path, seed: i32) -> Result<(), Box<dyn std::error::Error>> {
++        // The renderer reserves two texture slots for the TAS UI's sprites (see `stock_atlas_count`);
++        // savestates break unless they exist, so fill them like replay mode does.
++        for _ in 0..2 {
++            self.renderer.upload_sprite(Box::new([0, 0, 0, 0]), 1, 1, 0, 0)?;
++        }
++        self.frame_limiter = false;
++        self.rand.set_seed(seed);
++        self.clock = GameClock::SpoofedNanos(0);
++        self.init()?;
++        match self.scene_change {
++            Some(SceneChange::Room(id)) => self.load_room(id)?,
++            Some(SceneChange::Restart) => self.restart()?,
++            _ => (),
++        }
++
++        let _ = std::fs::remove_file(socket_path);
++        let listener = UnixListener::bind(socket_path)?;
++        println!("RL server listening on {}", socket_path.display());
++        let (stream, _) = listener.accept()?;
++        let mut reader = BufReader::new(stream.try_clone()?);
++        let mut writer = BufWriter::new(stream);
++
++        let mut held: BTreeSet<u8> = BTreeSet::new();
++        // Savestates restore the emulator's input state, so remember which keys the client held with each one
++        let mut saves: HashMap<u32, (SaveState, BTreeSet<u8>)> = HashMap::new();
++        let mut frame: u64 = 0;
++        let mut tracked: Option<i32> = None;
++        let mut trace: Vec<(i32, (bool, f32, f32, i32, f32, f32))> = Vec::new();
++
++        loop {
++            let op = match reader.read_u8() {
++                Ok(op) => op,
++                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
++                Err(e) => return Err(e.into()),
++            };
++            match op {
++                OP_STEP => {
++                    let n = reader.read_u8()?;
++                    let mut keys = BTreeSet::new();
++                    for _ in 0..n {
++                        keys.insert(reader.read_u8()?);
++                    }
++                    let frames = reader.read_u32::<LE>()?;
++                    let flags = reader.read_u8()?;
++                    let want_obs = flags & 1 != 0;
++                    let skip_draw = flags & 2 != 0;
++                    let want_trace = flags & 4 != 0;
++                    let no_draw = flags & 8 != 0;
++                    let stop_on_gone = flags & 16 != 0;
++                    trace.clear();
++
++                    for &k in held.difference(&keys) {
++                        self.input.button_release(k, true);
++                    }
++                    for &k in keys.difference(&held) {
++                        self.input.button_press(k, true);
++                    }
++                    held = keys;
++
++                    let mut status = STATUS_OK;
++                    let mut error = None;
++                    let frames = frames.max(1);
++                    for i in 0..frames {
++                        let skip = (no_draw || (skip_draw && i + 1 < frames)) && self.auto_draw;
++                        if skip {
++                            self.auto_draw = false;
++                        }
++                        let result = self.rl_frame();
++                        if skip {
++                            self.auto_draw = true;
++                        }
++                        let gone = if want_trace || stop_on_gone {
++                            let record = self.rl_trace_record(tracked);
++                            if want_trace {
++                                trace.push((self.room.id, record));
++                            }
++                            stop_on_gone && !record.0
++                        } else {
++                            false
++                        };
++                        match result {
++                            Ok(true) if gone => {
++                                frame += 1;
++                                break
++                            },
++                            Ok(true) => frame += 1,
++                            Ok(false) => {
++                                frame += 1;
++                                status = STATUS_ENDED;
++                                break
++                            },
++                            Err(e) => {
++                                status = STATUS_ERROR;
++                                error = Some(e.to_string());
++                                break
++                            },
++                        }
++                    }
++                    writer.write_u8(status)?;
++                    if let Some(msg) = error {
++                        write_str(&mut writer, msg.as_bytes())?;
++                    }
++                    writer.write_i32::<LE>(self.room.id)?;
++                    writer.write_u64::<LE>(frame)?;
++                    if want_obs {
++                        self.rl_write_obs(&mut writer)?;
++                    }
++                    if want_trace {
++                        writer.write_u32::<LE>(trace.len() as u32)?;
++                        for &(room, (alive, x, y, sprite, image_index, xscale)) in &trace {
++                            writer.write_i32::<LE>(room)?;
++                            writer.write_u8(alive as u8)?;
++                            writer.write_f32::<LE>(x)?;
++                            writer.write_f32::<LE>(y)?;
++                            writer.write_i32::<LE>(sprite)?;
++                            writer.write_f32::<LE>(image_index)?;
++                            writer.write_f32::<LE>(xscale)?;
++                        }
++                    }
++                },
++                OP_TRACK => {
++                    let len = reader.read_u16::<LE>()? as usize;
++                    let mut name = vec![0u8; len];
++                    reader.read_exact(&mut name)?;
++                    tracked = self.rl_object_index(&name);
++                    writer.write_u8(if tracked.is_some() { STATUS_OK } else { STATUS_ERROR })?;
++                },
++                OP_SAVE => {
++                    let slot = reader.read_u32::<LE>()?;
++                    let state = SaveState::from(&self, Replay::new(0, 0), self.renderer.state(), false);
++                    saves.insert(slot, (state, held.clone()));
++                    writer.write_u8(STATUS_OK)?;
++                },
++                OP_LOAD => {
++                    let slot = reader.read_u32::<LE>()?;
++                    match saves.get(&slot) {
++                        Some((state, saved_held)) => {
++                            let (_, renderer_state) = state.clone().load_into(&mut self);
++                            self.renderer.set_state(&renderer_state);
++                            held = saved_held.clone();
++                            writer.write_u8(STATUS_OK)?;
++                        },
++                        None => writer.write_u8(STATUS_ERROR)?,
++                    }
++                },
++                OP_OBS => self.rl_write_obs(&mut writer)?,
++                OP_QUERY => {
++                    let len = reader.read_u16::<LE>()? as usize;
++                    let mut name = vec![0u8; len];
++                    reader.read_exact(&mut name)?;
++                    let mut found = Vec::new();
++                    if let Some(object_index) = self.rl_object_index(&name) {
++                        let mut iter = self.room.instance_list.iter_by_identity(object_index);
++                        while let Some(handle) = iter.next(&self.room.instance_list) {
++                            let inst = self.room.instance_list.get(handle);
++                            if inst.state.get() == InstanceState::Active {
++                                found.push((
++                                    inst.id.get(),
++                                    f64::from(inst.x.get()),
++                                    f64::from(inst.y.get()),
++                                    f64::from(inst.hspeed.get()),
++                                    f64::from(inst.vspeed.get()),
++                                ));
++                            }
++                        }
++                    }
++                    writer.write_u32::<LE>(found.len() as u32)?;
++                    for (id, x, y, hspeed, vspeed) in found {
++                        writer.write_i32::<LE>(id)?;
++                        writer.write_f64::<LE>(x)?;
++                        writer.write_f64::<LE>(y)?;
++                        writer.write_f64::<LE>(hspeed)?;
++                        writer.write_f64::<LE>(vspeed)?;
++                    }
++                },
++                OP_INFO => {
++                    writer.write_i32::<LE>(self.room.id)?;
++                    writer.write_u32::<LE>(self.room.width.max(0) as u32)?;
++                    writer.write_u32::<LE>(self.room.height.max(0) as u32)?;
++                    writer.write_u32::<LE>(self.room.speed)?;
++                    let name = usize::try_from(self.room.id)
++                        .ok()
++                        .and_then(|i| self.assets.rooms.get(i))
++                        .and_then(|r| r.as_ref())
++                        .map(|r| r.name.as_ref().to_vec())
++                        .unwrap_or_default();
++                    write_str(&mut writer, &name)?;
++                    writer.write_u64::<LE>(frame)?;
++                },
++                OP_EXEC => {
++                    let len = reader.read_u32::<LE>()? as usize;
++                    let mut code = vec![0u8; len];
++                    reader.read_exact(&mut code)?;
++                    match self.rl_exec(&code) {
++                        Ok(value) => {
++                            writer.write_u8(STATUS_OK)?;
++                            match value {
++                                Value::Real(r) => {
++                                    writer.write_u8(0)?;
++                                    writer.write_f64::<LE>(r.into())?;
++                                },
++                                Value::Str(s) => {
++                                    writer.write_u8(1)?;
++                                    write_str(&mut writer, s.as_ref())?;
++                                },
++                            }
++                        },
++                        Err(e) => {
++                            writer.write_u8(STATUS_ERROR)?;
++                            write_str(&mut writer, e.to_string().as_bytes())?;
++                        },
++                    }
++                },
++                OP_QUIT => break,
++                other => return Err(format!("RL client sent unknown opcode {}", other).into()),
++            }
++            writer.flush()?;
++        }
++
++        let _ = std::fs::remove_file(socket_path);
++        Ok(())
++    }
++}
+diff --git a/gm8emulator/src/game/savestate.rs b/gm8emulator/src/game/savestate.rs
+index 09e5c8e..9d48a29 100644
+--- a/gm8emulator/src/game/savestate.rs
++++ b/gm8emulator/src/game/savestate.rs
+@@ -39,6 +39,7 @@ pub struct SaveState {
+     pub textures: Vec<Option<SavedTexture>>,
+ 
+     pub externals: external::ExternalState,
++    pub fmod: external::fmod::FmodState,
+     pub surface_fix: bool,
+ 
+     pub view_current: usize,
+@@ -139,6 +140,7 @@ impl SaveState {
+             background_colour: game.background_colour,
+             textures: game.renderer.dump_dynamic_textures(),
+             externals: game.externals.save_state(),
++            fmod: game.fmod.save_state(),
+             surface_fix: game.surface_fix.clone(),
+             view_current: game.view_current,
+             last_instance_id: game.last_instance_id.clone(),
+@@ -221,6 +223,7 @@ impl SaveState {
+         }
+ 
+         game.externals.load_state(self.externals);
++        game.fmod.load_state(self.fmod);
+ 
+         game.surface_fix = self.surface_fix;
+ 
+diff --git a/gm8emulator/src/gml/kernel.rs b/gm8emulator/src/gml/kernel.rs
+index 86babd5..3a5075d 100644
+--- a/gm8emulator/src/gml/kernel.rs
++++ b/gm8emulator/src/gml/kernel.rs
+@@ -3880,6 +3880,11 @@ impl Game {
+                     return Err(gml::Error::ReplayError("randomize".into()))
+                 }
+             },
++            // Derive the new seed from the current one so RL runs stay reproducible
++            PlayType::Rl => {
++                let seed = self.rand.seed();
++                self.rand.set_seed(seed.wrapping_mul(1103515245).wrapping_add(12345));
++            },
+         }
+         Ok(Default::default())
+     }
+@@ -5805,7 +5810,7 @@ impl Game {
+                         datetime::sleep(duration);
+                         self.process_window_events();
+                     },
+-                    PlayType::Record => (),
++                    PlayType::Record | PlayType::Rl => (),
+                     PlayType::Replay => datetime::sleep(duration),
+                 }
+ 
+@@ -6267,6 +6272,7 @@ impl Game {
+             return Ok(b"".as_ref().into())
+         }
+         // unwrap arguments
++        let path = file::to_path(path.as_ref());
+         let path: &str = path.as_ref();
+         let include_read_only = (attribs & 1) != 0;
+         let include_hidden = (attribs & 2) != 0;
+@@ -8569,6 +8575,22 @@ impl Game {
+     }
+ 
+     pub fn sprite_replace(&mut self, args: &[Value]) -> gml::Result<Value> {
++        // GM7 signature: (ind, fname, imgnumb, precise, transparent, smooth, preload, xorig, yorig)
++        let gm7_args;
++        let args = if args.len() == 9 {
++            gm7_args = [
++                args[0].clone(),
++                args[1].clone(),
++                args[2].clone(),
++                args[4].clone(),
++                args[5].clone(),
++                args[7].clone(),
++                args[8].clone(),
++            ];
++            &gm7_args[..]
++        } else {
++            args
++        };
+         let (sprite_id, fname, imgnumb, removeback, smooth, origin_x, origin_y) =
+             expect_args!(args, [int, string, int, bool, bool, int, int])?;
+         if let Some(sprite) = self.assets.sprites.get_asset_mut(sprite_id) {
+diff --git a/gm8emulator/src/main.rs b/gm8emulator/src/main.rs
+index 1f4cded..2dfc013 100644
+--- a/gm8emulator/src/main.rs
++++ b/gm8emulator/src/main.rs
+@@ -60,6 +60,8 @@ fn xmain() -> i32 {
+     opts.optopt("f", "replay-file", "path to savestate file to replay", "FILE");
+     opts.optopt("o", "output-file", "output savestate name in replay mode", "FILE.bin");
+     opts.optmulti("a", "game-arg", "argument to pass to the game", "ARG");
++    opts.optopt("", "rl-socket", "serve a reinforcement learning client on this Unix socket", "PATH");
++    opts.optopt("", "rl-seed", "RNG seed used in RL mode (default 0)", "SEED");
+     opts.optflagopt("p", "start-save", "Either loads the savestate specified after this parameter or starts at the first frame. If a .gmtas is specified by -f this will start the replay from this savestate instead", "savestate");
+ 
+     let matches = match opts.parse(&args[1..]) {
+@@ -98,6 +100,14 @@ fn xmain() -> i32 {
+     let frame_limiter = !matches.opt_present("l");
+     let verbose = matches.opt_present("v");
+     let output_bin = matches.opt_str("o").map(PathBuf::from);
++    let rl_socket = matches.opt_str("rl-socket").map(PathBuf::from);
++    let rl_seed = match matches.opt_str("rl-seed").map(|s| s.parse::<i32>()).transpose() {
++        Ok(seed) => seed.unwrap_or(0),
++        Err(e) => {
++            eprintln!("invalid --rl-seed: {}", e);
++            return EXIT_FAILURE;
++        },
++    };
+     let pause = matches.opt_present("p");
+     let start_save_path = matches.opt_str("p").map(PathBuf::from);
+     let project_path = matches.opt_str("n").map(|name| {
+@@ -227,7 +237,9 @@ fn xmain() -> i32 {
+ 
+     let encoding = encoding_rs::SHIFT_JIS; // TODO: argument
+ 
+-    let play_type = if project_path.is_some() {
++    let play_type = if rl_socket.is_some() {
++        PlayType::Rl
++    } else if project_path.is_some() {
+         PlayType::Record
+     } else if replay.is_some() {
+         PlayType::Replay
+@@ -272,7 +284,9 @@ fn xmain() -> i32 {
+             .filter(|i| i.remove_at_end)
+             .map(|i| PathBuf::from(components.decode_str(i.name.as_ref()).into_owned()))
+             .collect::<Vec<_>>();
+-        let result = if let Some(replay) = replay {
++        let result = if let Some(socket) = &rl_socket {
++            components.rl_server(socket, rl_seed)
++        } else if let Some(replay) = replay {
+             components.replay(replay, output_bin, start_save_path.as_ref())
+         } else {
+             components.clock = if spoof_time { time_now } else { GameClock::StartupEpoch(std::time::Instant::now()) };
+diff --git a/gm8exe/src/gm7.rs b/gm8exe/src/gm7.rs
+new file mode 100644
+index 0000000..bc56601
+--- /dev/null
++++ b/gm8exe/src/gm7.rs
+@@ -0,0 +1,530 @@
++//! GameMaker 7.0 executable support.
++//!
++//! GM7 executables keep the gamedata at a fixed offset (1980000) and differ from GM8.0 in a few ways:
++//!  - the settings block is stored uncompressed (version 702),
++//!  - after the embedded D3DX8 DLL comes a single zlib stream holding *all* assets, obfuscated with the
++//!    seed-based swap table also used by .gmk files ("GMKrypt"),
++//!  - assets are stored inline (not individually compressed) with older version numbers,
++//!  - sprite frames are BGR with no alpha (colour-key transparency) and carry no collision masks,
++//!  - objects have 11 event lists instead of 12 (no trigger events).
++//!
++//! The result is presented as a GameMaker 8.0 game, whose runtime is close to a superset of GM7's.
++
++use crate::{
++    asset::{
++        font::Font,
++        object::Object,
++        sprite::{CollisionMap, Frame},
++        Asset, Background, CodeAction, Constant, Error, PascalString, Path, ReadChunk, ReadPascalString, Room, Script,
++        Sound,
++        Sprite, Timeline,
++    },
++    reader::ReaderError,
++    settings::{GameHelpDialog, Settings},
++    AssetList, GameAssets, GameVersion,
++};
++use byteorder::{ReadBytesExt, LE};
++use flate2::read::ZlibDecoder;
++use std::io::{self, Read, Seek, SeekFrom};
++
++const HEADER_OFFSET: u64 = 1980000;
++const MAGIC: u32 = 1234321;
++
++type Cursor<'a> = io::Cursor<&'a [u8]>;
++
++/// Returns true if this looks like a GameMaker 7.0 executable.
++pub fn check(exe: &[u8]) -> bool {
++    let pos = HEADER_OFFSET as usize;
++    match (exe.get(pos..pos + 4), exe.get(pos + 4..pos + 8)) {
++        (Some(magic), Some(ver)) => {
++            u32::from_le_bytes(magic.try_into().unwrap()) == MAGIC && u32::from_le_bytes(ver.try_into().unwrap()) == 700
++        },
++        _ => false,
++    }
++}
++
++fn read_bool(r: &mut impl Read) -> io::Result<bool> {
++    Ok(r.read_u32::<LE>()? != 0)
++}
++
++fn expect_ver(what: &'static str, expected: u32, got: u32, strict: bool) -> Result<(), ReaderError> {
++    if strict && got != expected {
++        let _ = what;
++        return Err(ReaderError::AssetError(Error::VersionError { expected, got }))
++    }
++    Ok(())
++}
++
++fn inflate_all(data: &[u8]) -> io::Result<Vec<u8>> {
++    let mut out = Vec::new();
++    ZlibDecoder::new(data).read_to_end(&mut out)?;
++    Ok(out)
++}
++
++/// Reads an optional zlib blob as stored in GM7 settings: `exists, len, data`.
++fn skip_blob_maybe(r: &mut Cursor) -> io::Result<()> {
++    if read_bool(r)? {
++        let len = r.read_u32::<LE>()?;
++        r.seek(SeekFrom::Current(len.into()))?;
++    }
++    Ok(())
++}
++
++/// Builds the inverse of GM7's seeded byte-substitution table.
++fn reverse_swap_table(seed: u32) -> [u8; 256] {
++    let a = 6 + (seed % 250);
++    let b = seed / 250;
++    let mut table = [0u8; 256];
++    for (i, x) in table.iter_mut().enumerate() {
++        *x = i as u8;
++    }
++    for i in 1..=10000u32 {
++        let j = (1 + ((i * a + b) % 254)) as usize;
++        table.swap(j, j + 1);
++    }
++    let mut reverse = [0u8; 256];
++    for i in 1..256 {
++        reverse[table[i] as usize] = i as u8;
++    }
++    reverse
++}
++
++/// Script sources are stored as zlib streams, substitution-encrypted with the fixed seed 12345,
++/// holding a length-prefixed string.
++fn decode_script(data: &[u8]) -> Result<PascalString, ReaderError> {
++    let reverse = reverse_swap_table(12345);
++    let plain = inflate_all(data)?.into_iter().map(|b| reverse[b as usize]).collect::<Vec<_>>();
++    Ok(io::Cursor::new(plain.as_slice()).read_pas_string()?)
++}
++
++/// Removes the GMKrypt obfuscation: `bill, fred, junk[bill], seed, junk[fred], 1 plain byte, data...`
++fn deobfuscate(data: &[u8]) -> Result<Vec<u8>, ReaderError> {
++    let mut r = io::Cursor::new(data);
++    let bill = r.read_u32::<LE>()? as u64;
++    let fred = r.read_u32::<LE>()? as u64;
++    r.seek(SeekFrom::Current((bill * 4) as i64))?;
++    let seed = r.read_u32::<LE>()?;
++    r.seek(SeekFrom::Current((fred * 4) as i64))?;
++    let start = r.position() as usize;
++    if start >= data.len() {
++        return Err(ReaderError::UnknownFormat)
++    }
++
++    let reverse = reverse_swap_table(seed);
++    let mut out = Vec::with_capacity(data.len() - start);
++    out.push(data[start]);
++    for (pos, &byte) in data.iter().enumerate().skip(start + 1) {
++        out.push(reverse[byte as usize].wrapping_sub(pos as u8));
++    }
++    Ok(out)
++}
++
++/// Reads a GM7 image block (`540, exists, width, height, len, zlib BGR0 data`) as BGRA.
++/// GM7 stores no alpha, so if `transparent` is set the bottom-left pixel's colour becomes fully transparent.
++fn read_image(r: &mut Cursor, transparent: bool, strict: bool) -> Result<Option<(u32, u32, Box<[u8]>)>, ReaderError> {
++    expect_ver("image", 540, r.read_u32::<LE>()?, strict)?;
++    if r.read_i32::<LE>()? == -1 {
++        return Ok(None)
++    }
++    let width = r.read_u32::<LE>()?;
++    let height = r.read_u32::<LE>()?;
++    let len = r.read_u32::<LE>()? as usize;
++    let mut data = inflate_all(&r.read_chunk(len)?)?;
++    if data.len() != width as usize * height as usize * 4 {
++        return Err(ReaderError::AssetError(Error::MalformedData))
++    }
++    let key = if transparent && width > 0 && height > 0 {
++        let i = (height as usize - 1) * width as usize * 4;
++        Some([data[i], data[i + 1], data[i + 2]])
++    } else {
++        None
++    };
++    for px in data.chunks_exact_mut(4) {
++        px[3] = if key.map_or(false, |k| px[..3] == k) { 0 } else { 255 };
++    }
++    Ok(Some((width, height, data.into_boxed_slice())))
++}
++
++fn read_settings(r: &mut Cursor) -> Result<Settings, ReaderError> {
++    let fullscreen = read_bool(r)?;
++    let interpolate_pixels = read_bool(r)?;
++    let dont_draw_border = read_bool(r)?;
++    let display_cursor = read_bool(r)?;
++    let scaling = r.read_i32::<LE>()?;
++    let allow_resize = read_bool(r)?;
++    let window_on_top = read_bool(r)?;
++    let clear_colour = r.read_u32::<LE>()?;
++    let set_resolution = read_bool(r)?;
++    let colour_depth = r.read_u32::<LE>()?;
++    let resolution = r.read_u32::<LE>()?;
++    let frequency = r.read_u32::<LE>()?;
++    let dont_show_buttons = read_bool(r)?;
++    let vsync = read_bool(r)?;
++    let f4_fullscreen_toggle = read_bool(r)?;
++    let f1_help_menu = read_bool(r)?;
++    let esc_close_game = read_bool(r)?;
++    let f5_save_f6_load = read_bool(r)?;
++    let f9_screenshot = read_bool(r)?;
++    let treat_close_as_esc = read_bool(r)?;
++    let priority = r.read_u32::<LE>()?;
++    let freeze_on_lose_focus = read_bool(r)?;
++    // Loading bar images are only cosmetic and GM7 stores them in a different encoding, so they're dropped.
++    if r.read_u32::<LE>()? != 0 {
++        skip_blob_maybe(r)?;
++        skip_blob_maybe(r)?;
++    }
++    skip_blob_maybe(r)?;
++    let transparent = read_bool(r)?;
++    let translucency = r.read_u32::<LE>()?;
++    let scale_progress_bar = read_bool(r)?;
++    let show_error_messages = read_bool(r)?;
++    let log_errors = read_bool(r)?;
++    let always_abort = read_bool(r)?;
++    let zero_uninitialized_vars = read_bool(r)?;
++    r.read_u32::<LE>()?; // unknown trailing field
++
++    Ok(Settings {
++        fullscreen,
++        scaling,
++        interpolate_pixels,
++        clear_colour,
++        allow_resize,
++        window_on_top,
++        dont_draw_border,
++        dont_show_buttons,
++        display_cursor,
++        freeze_on_lose_focus,
++        disable_screensaver: false,
++        force_cpu_render: true,
++        set_resolution,
++        colour_depth,
++        resolution,
++        frequency,
++        vsync,
++        esc_close_game,
++        treat_close_as_esc,
++        f1_help_menu,
++        f4_fullscreen_toggle,
++        f5_save_f6_load,
++        f9_screenshot,
++        priority,
++        custom_load_image: None,
++        transparent,
++        translucency,
++        loading_bar: 0,
++        backdata: None,
++        frontdata: None,
++        scale_progress_bar,
++        show_error_messages,
++        log_errors,
++        always_abort,
++        zero_uninitialized_vars,
++        error_on_uninitialized_args: false,
++        swap_creation_events: false,
++    })
++}
++
++/// Reads `version, count, [exists, asset]...` where each asset can be parsed by the GM8 exe deserializer.
++fn read_list<T: Asset>(r: &mut Cursor, header: u32, strict: bool) -> Result<AssetList<T>, ReaderError> {
++    expect_ver("asset header", header, r.read_u32::<LE>()?, strict)?;
++    let count = r.read_u32::<LE>()?;
++    (0..count)
++        .map(|_| {
++            if read_bool(r)? {
++                Ok(Some(Box::new(T::deserialize_exe(&mut *r, GameVersion::GameMaker8_0, false)?)))
++            } else {
++                Ok(None)
++            }
++        })
++        .collect()
++}
++
++fn read_list_with<T>(
++    r: &mut Cursor,
++    header: u32,
++    strict: bool,
++    mut f: impl FnMut(&mut Cursor) -> Result<T, ReaderError>,
++) -> Result<AssetList<T>, ReaderError> {
++    expect_ver("asset header", header, r.read_u32::<LE>()?, strict)?;
++    let count = r.read_u32::<LE>()?;
++    (0..count).map(|_| if read_bool(r)? { Ok(Some(Box::new(f(r)?))) } else { Ok(None) }).collect()
++}
++
++fn read_sprite(r: &mut Cursor, strict: bool) -> Result<Sprite, ReaderError> {
++    let name = r.read_pas_string()?;
++    expect_ver("sprite", 542, r.read_u32::<LE>()?, strict)?;
++    let width = r.read_u32::<LE>()?;
++    let height = r.read_u32::<LE>()?;
++    let bbox_left = r.read_i32::<LE>()?;
++    let bbox_right = r.read_i32::<LE>()?;
++    let bbox_bottom = r.read_i32::<LE>()?;
++    let bbox_top = r.read_i32::<LE>()?;
++    let transparent = read_bool(r)?;
++    let _smooth_edges = read_bool(r)?;
++    let _preload = read_bool(r)?;
++    let _bbox_mode = r.read_u32::<LE>()?;
++    let precise = read_bool(r)?;
++    let origin_x = r.read_i32::<LE>()?;
++    let origin_y = r.read_i32::<LE>()?;
++    let frame_count = r.read_u32::<LE>()?;
++
++    let frames = (0..frame_count)
++        .map(|_| {
++            Ok(match read_image(r, transparent, strict)? {
++                Some((width, height, data)) => Frame { width, height, data },
++                None => Frame { width, height, data: vec![0u8; width as usize * height as usize * 4].into() },
++            })
++        })
++        .collect::<Result<Vec<_>, ReaderError>>()?;
++
++    // GM7 builds collision masks at load time: the bounding box intersected with the opaque pixels
++    // of each frame when precise, otherwise the plain bounding box shared by all frames.
++    let clamp = |v: i32, max: u32| v.clamp(0, max.saturating_sub(1) as i32) as u32;
++    let (left, right) = (clamp(bbox_left, width), clamp(bbox_right, width));
++    let (top, bottom) = (clamp(bbox_top, height), clamp(bbox_bottom, height));
++    let in_bbox = |x: u32, y: u32| x >= left && x <= right && y >= top && y <= bottom;
++    let make_map = |frame: Option<&Frame>| {
++        let data = (0..height)
++            .flat_map(|y| (0..width).map(move |x| (x, y)))
++            .map(|(x, y)| {
++                in_bbox(x, y)
++                    && frame.map_or(true, |f| {
++                        f.width != width || f.data[(y * width + x) as usize * 4 + 3] != 0
++                    })
++            })
++            .collect::<Vec<_>>()
++            .into_boxed_slice();
++        CollisionMap { width, height, bbox_left: left, bbox_right: right, bbox_top: top, bbox_bottom: bottom, data }
++    };
++    let (colliders, per_frame_colliders) = if frames.is_empty() {
++        (Vec::new(), false)
++    } else if precise {
++        (frames.iter().map(|f| make_map(Some(f))).collect(), true)
++    } else {
++        (vec![make_map(None)], false)
++    };
++
++    Ok(Sprite { name, origin_x, origin_y, frames, colliders, per_frame_colliders })
++}
++
++fn read_background(r: &mut Cursor, strict: bool) -> Result<Background, ReaderError> {
++    let name = r.read_pas_string()?;
++    expect_ver("background", 543, r.read_u32::<LE>()?, strict)?;
++    let mut width = r.read_u32::<LE>()?;
++    let mut height = r.read_u32::<LE>()?;
++    let transparent = read_bool(r)?;
++    let _smooth_edges = read_bool(r)?;
++    let _preload = read_bool(r)?;
++    let data = if read_bool(r)? {
++        read_image(r, transparent, strict)?.map(|(w, h, data)| {
++            width = w;
++            height = h;
++            data
++        })
++    } else {
++        None
++    };
++    Ok(Background { name, width, height, data })
++}
++
++fn read_font(r: &mut Cursor, strict: bool) -> Result<Font, ReaderError> {
++    let name = r.read_pas_string()?;
++    expect_ver("font", 540, r.read_u32::<LE>()?, strict)?;
++    let sys_name = r.read_pas_string()?;
++    let size = r.read_u32::<LE>()?;
++    let bold = read_bool(r)?;
++    let italic = read_bool(r)?;
++    let range_start = r.read_u32::<LE>()?;
++    let range_end = r.read_u32::<LE>()?;
++    let mut dmap = [0u32; 0x600];
++    for val in dmap.iter_mut() {
++        *val = r.read_u32::<LE>()?;
++    }
++    let map_width = r.read_u32::<LE>()?;
++    let map_height = r.read_u32::<LE>()?;
++    let len = r.read_u32::<LE>()? as usize;
++    let pixel_map = inflate_all(&r.read_chunk(len)?)?.into_boxed_slice();
++    Ok(Font {
++        name,
++        sys_name,
++        size,
++        bold,
++        italic,
++        range_start,
++        range_end,
++        charset: 0,
++        aa_level: 0,
++        dmap: Box::new(dmap),
++        map_width,
++        map_height,
++        pixel_map,
++    })
++}
++
++fn read_object(r: &mut Cursor, strict: bool) -> Result<Object, ReaderError> {
++    let name = r.read_pas_string()?;
++    expect_ver("object", 430, r.read_u32::<LE>()?, strict)?;
++    let sprite_index = r.read_i32::<LE>()?;
++    let solid = read_bool(r)?;
++    let visible = read_bool(r)?;
++    let depth = r.read_i32::<LE>()?;
++    let persistent = read_bool(r)?;
++    let parent_index = r.read_i32::<LE>()?;
++    let mask_index = r.read_i32::<LE>()?;
++
++    // GM7 has 11 event types (0..=10); GM8 added triggers as the 12th, which we leave empty.
++    let event_list_count = r.read_u32::<LE>()?;
++    if event_list_count > 11 {
++        return Err(ReaderError::AssetError(Error::MalformedData))
++    }
++    let mut events = Vec::with_capacity(12);
++    for _ in 0..=event_list_count {
++        let mut sub_event_list = Vec::new();
++        while let Ok(index) = u32::try_from(r.read_i32::<LE>()?) {
++            expect_ver("event", 400, r.read_u32::<LE>()?, strict)?;
++            let action_count = r.read_u32::<LE>()?;
++            let actions = (0..action_count)
++                .map(|_| CodeAction::deserialize_exe(&mut *r, GameVersion::GameMaker8_0, false))
++                .collect::<Result<_, _>>()?;
++            sub_event_list.push((index, actions));
++        }
++        events.push(sub_event_list);
++    }
++    while events.len() < 12 {
++        events.push(Vec::new());
++    }
++
++    Ok(Object { name, sprite_index, solid, visible, depth, persistent, parent_index, mask_index, events })
++}
++
++/// Parses a GameMaker 7.0 executable. Call `check` first.
++pub fn from_exe<F>(
++    exe: &[u8],
++    ico_file_raw: Option<Vec<u8>>,
++    logger: Option<F>,
++    strict: bool,
++) -> Result<GameAssets, ReaderError>
++where
++    F: Copy + Fn(&str),
++{
++    let mut r = io::Cursor::new(exe);
++    r.set_position(HEADER_OFFSET + 8);
++    let _debug = read_bool(&mut r)?;
++    expect_ver("settings", 702, r.read_u32::<LE>()?, strict)?;
++    let settings = read_settings(&mut r)?;
++    log!(logger, "Read GM7 settings, now at 0x{:X}", r.position());
++
++    let dll_name = r.read_pas_string()?;
++    let dll_len = r.read_u32::<LE>()? as usize;
++    let dx_dll = r.read_chunk(dll_len)?;
++    log!(logger, "Skipped embedded DLL '{}' ({} bytes)", dll_name, dll_len);
++
++    let data_len = r.read_u32::<LE>()? as usize;
++    let compressed = r.read_chunk(data_len)?;
++    let data = deobfuscate(&inflate_all(&compressed)?)?;
++    log!(logger, "Inflated and decrypted GM7 asset data ({} bytes)", data.len());
++
++    let mut r = io::Cursor::new(data.as_slice());
++    let _unknown = r.read_u32::<LE>()?;
++    let game_id = r.read_u32::<LE>()?;
++    let guid = [r.read_u32::<LE>()?, r.read_u32::<LE>()?, r.read_u32::<LE>()?, r.read_u32::<LE>()?];
++    log!(logger, "Game ID: {}", game_id);
++
++    expect_ver("extensions header", 700, r.read_u32::<LE>()?, strict)?;
++    if r.read_u32::<LE>()? != 0 {
++        log!(logger, "GM7 extension packages are not supported");
++        return Err(ReaderError::UnknownFormat)
++    }
++
++    // Sound data is individually zlib-compressed in GM7 and scripts have their own encoding; the rest is raw.
++    let mut sounds: AssetList<Sound> = read_list(&mut r, 400, strict)?;
++    for sound in sounds.iter_mut().flatten() {
++        if let Some(data) = &mut sound.data {
++            *data = inflate_all(data)?.into_boxed_slice();
++        }
++    }
++    log!(logger, " + {} sounds", sounds.len());
++    let sprites = read_list_with(&mut r, 400, strict, |r| read_sprite(r, strict))?;
++    log!(logger, " + {} sprites", sprites.len());
++    let backgrounds = read_list_with(&mut r, 400, strict, |r| read_background(r, strict))?;
++    log!(logger, " + {} backgrounds", backgrounds.len());
++    let paths: AssetList<Path> = read_list(&mut r, 420, strict)?;
++    log!(logger, " + {} paths", paths.len());
++    let mut scripts: AssetList<Script> = read_list(&mut r, 400, strict)?;
++    for script in scripts.iter_mut().flatten() {
++        if !script.source.0.is_empty() {
++            script.source = decode_script(&script.source.0)?;
++        }
++    }
++    log!(logger, " + {} scripts", scripts.len());
++    let fonts = read_list_with(&mut r, 540, strict, |r| read_font(r, strict))?;
++    log!(logger, " + {} fonts", fonts.len());
++    let timelines: AssetList<Timeline> = read_list(&mut r, 500, strict)?;
++    log!(logger, " + {} timelines", timelines.len());
++    let objects = read_list_with(&mut r, 400, strict, |r| read_object(r, strict))?;
++    log!(logger, " + {} objects", objects.len());
++    let rooms: AssetList<Room> = read_list(&mut r, 420, strict)?;
++    log!(logger, " + {} rooms", rooms.len());
++
++    let last_instance_id = r.read_i32::<LE>()?;
++    let last_tile_id = r.read_i32::<LE>()?;
++
++    expect_ver("included files header", 620, r.read_u32::<LE>()?, strict)?;
++    if r.read_u32::<LE>()? != 0 {
++        log!(logger, "GM7 included files are not supported");
++        return Err(ReaderError::UnknownFormat)
++    }
++
++    expect_ver("help dialog", 600, r.read_u32::<LE>()?, strict)?;
++    let help_dialog = GameHelpDialog {
++        bg_colour: r.read_u32::<LE>()?.into(),
++        new_window: read_bool(&mut r)?,
++        caption: r.read_pas_string()?,
++        left: r.read_i32::<LE>()?,
++        top: r.read_i32::<LE>()?,
++        width: r.read_u32::<LE>()?,
++        height: r.read_u32::<LE>()?,
++        border: read_bool(&mut r)?,
++        resizable: read_bool(&mut r)?,
++        window_on_top: read_bool(&mut r)?,
++        freeze_game: read_bool(&mut r)?,
++        info: r.read_pas_string()?,
++    };
++
++    expect_ver("action library initialization code header", 500, r.read_u32::<LE>()?, strict)?;
++    let str_count = r.read_u32::<LE>()?;
++    let library_init_strings = (0..str_count).map(|_| r.read_pas_string()).collect::<io::Result<_>>()?;
++
++    expect_ver("room order lookup", 700, r.read_u32::<LE>()?, strict)?;
++    let ro_count = r.read_u32::<LE>()?;
++    let room_order = (0..ro_count).map(|_| r.read_i32::<LE>()).collect::<io::Result<_>>()?;
++
++    Ok(GameAssets {
++        extensions: Vec::new(),
++        sprites,
++        sounds,
++        backgrounds,
++        paths,
++        scripts,
++        fonts,
++        timelines,
++        objects,
++        triggers: Vec::new(),
++        constants: Vec::<Constant>::new(),
++        rooms,
++        included_files: Vec::new(),
++
++        dx_dll,
++        ico_file_raw,
++        version: GameVersion::GameMaker8_0,
++        help_dialog,
++        last_instance_id,
++        last_tile_id,
++        library_init_strings,
++        room_order,
++
++        settings,
++        game_id,
++        guid,
++    })
++}
+diff --git a/gm8exe/src/lib.rs b/gm8exe/src/lib.rs
+index 06eb665..41538fb 100644
+--- a/gm8exe/src/lib.rs
++++ b/gm8exe/src/lib.rs
+@@ -21,6 +21,7 @@ macro_rules! log {
+ pub mod asset;
+ pub mod def;
+ pub mod gamedata;
++pub mod gm7;
+ pub mod reader;
+ pub mod rsrc;
+ pub mod settings;
+diff --git a/gm8exe/src/reader.rs b/gm8exe/src/reader.rs
+index cbefb67..5848265 100644
+--- a/gm8exe/src/reader.rs
++++ b/gm8exe/src/reader.rs
+@@ -155,6 +155,12 @@ where
+         None => None,
+     };
+ 
++    // GameMaker 7.0 uses a different container, handled separately
++    if upx_data.is_none() && crate::gm7::check(exe.get_ref()) {
++        log!(logger, "Detected GameMaker 7.0 format");
++        return crate::gm7::from_exe(exe.get_ref(), ico_file_raw, logger, strict)
++    }
++
+     // Identify the game version in use and locate the gamedata header
+     let game_ver = gamedata::find(&mut exe, logger, upx_data)?;
+ 
