@@ -16,13 +16,13 @@ import multiprocessing as mp
 import shutil
 import sys
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import numpy as np
 
 from . import almacen
 from .nucleo import (Config, Resultado, cruzar, evaluar_en_worker, genes_al_azar, genes_usados, iniciar_worker, mutar,
-                     nicho, resolver_rooms, resolver_zonas, torneo)
+                     nicho, resolver_rooms, resolver_saves, resolver_zonas, torneo)
 
 
 def resumen(gen: int, pob: list[Resultado], evaluados: int, reloj: float, cfg: Config) -> dict:
@@ -33,6 +33,9 @@ def resumen(gen: int, pob: list[Resultado], evaluados: int, reloj: float, cfg: C
         "progreso_final_max": round(100 * max(r.progreso for r in pob), 2),
         "progreso_media": round(100 * float(np.mean([r.progreso for r in pob])), 2),
         "nichos": len({nicho(r, cfg) for r in pob}),
+        "saves_max": max(r.saves for r in pob),
+        "saves_media": round(float(np.mean([r.saves for r in pob])), 2),
+        "reintentos_media": round(float(np.mean([r.muertes for r in pob])), 2),
         "gen": gen,
         "fitness_max": round(float(fit.max()), 2),
         "fitness_media": round(float(fit.mean()), 2),
@@ -81,8 +84,7 @@ def siguiente_generacion(rng: np.random.Generator, pob: list[Resultado], cfg: Co
     elite = []
     for i in orden[: cfg.elite]:
         r = pob[i]
-        elite.append(Resultado(r.genoma, r.fitness, r.murio, r.frames, r.llego, r.pantallas, r.celdas,
-                               r.frame_progreso, r.traza, (i,), "elite"))
+        elite.append(replace(r, padres=(i,), origen="elite"))
     tareas = []
     while len(elite) + len(tareas) < cfg.poblacion:
         ia = torneo(rng, pob, cfg.torneo)
@@ -109,8 +111,7 @@ def siguiente_generacion_nichos(rng: np.random.Generator, pob: list[Resultado], 
     elite = []
     for i in padres[: cfg.elite]:
         r = pob[i]
-        elite.append(Resultado(r.genoma, r.fitness, r.murio, r.frames, r.llego, r.pantallas, r.celdas,
-                               r.frame_progreso, r.traza, (i,), "elite", r.progreso, r.progreso_max))
+        elite.append(replace(r, padres=(i,), origen="elite"))
     vistas = {huella(pob[i].genoma, pob[i].frames) for i in range(len(pob))}
     tareas = []
     turno = list(padres)
@@ -195,13 +196,15 @@ def main():
     if cfg.room_entrenamiento < 0:
         resolver_rooms(cfg)
     resolver_zonas(cfg)
+    resolver_saves(cfg)
     carpeta.mkdir(parents=True, exist_ok=True)
     almacen.guardar_config(carpeta, cfg)
 
     rng = np.random.default_rng(cfg.seed + 1000 * (hechas[-1] + 1 if hechas else 0))
     print(f"corrida {carpeta}  población {cfg.poblacion}  workers {cfg.workers}  "
           f"tope {cfg.max_segundos:.0f} s de juego  room {cfg.room_entrenamiento} -> {cfg.sala_objetivo} "
-          f"({cfg.room_objetivo})  zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}", flush=True)
+          f"({cfg.room_objetivo})  zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}  reintentos: {cfg.resets}  "
+          f"save points: {len(cfg.save_points.split(';')) if cfg.save_points else 0}", flush=True)
 
     inicio_total = time.time()
     with mp.get_context("spawn").Pool(cfg.workers, initializer=iniciar_worker, initargs=(cfg,)) as pool:
@@ -236,6 +239,7 @@ def main():
 def imprimir(f: dict) -> None:
     print(f"gen {f['gen']:4d} | fitness máx {f['fitness_max']:8.1f} media {f['fitness_media']:7.1f} | "
           f"camino máx {f['progreso_max']:5.1f} % | nichos {f['nichos']:3d} | "
+          f"saves máx {f['saves_max']} media {f['saves_media']:4.2f} | reintentos {f['reintentos_media']:4.2f} | "
           f"pantallas máx {f['pantallas_max']} llegaron {f['llegaron']} | "
           f"muertes {f['muertes_pct']:5.1f} % | vida media {f['segundos_medio']:6.1f} s | "
           f"{f['segundos_reloj']:6.1f} s", flush=True)

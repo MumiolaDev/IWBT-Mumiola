@@ -13,7 +13,8 @@ OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llev
 - El GB corre nativo (`./scripts/jugar.sh`). 2026-10-23: el usuario retomó el RL para un video de YouTube. Hay
   un algoritmo genético en `ga/`; corridas en `corridas/`: `rStage01` (exp. 1, exploración, estancado en la mitad
   superior), `salida01` (exp. 2, distancia a la salida por el laberinto, nichos, 1 min) y las que lanza el usuario
-  desde la app. La sala de portales de `rStage01` es zona prohibida (`zonas_prohibidas`, cuenta como muerte). `corridas/` es un
+  desde la app. La sala de portales de `rStage01` es zona prohibida (`zonas_prohibidas`, cuenta como muerte).
+  Desde el 2026-10-23 los agentes tienen 3 reintentos (R → último save) y premio por save point nuevo. `corridas/` es un
   enlace a `/mnt/datos/iwbtgb/corridas` (disco duro de datos): ahí van las corridas largas.
 - Detalles del formato GM7 en `docs/formato-gm7.md`; guía y protocolo RL en `docs/entorno-rl.md`. Leerlos
   antes de tocar el lector GM7 o el modo RL.
@@ -66,6 +67,8 @@ ignora. Python: `uv` con `.venv` (numpy, gymnasium, pillow, matplotlib y pyside6
   build debug con `RUST_BACKTRACE=1`.
 - **El emulador loguea por stdout**, por eso el protocolo RL usa un socket Unix. Las rutas tienen un máximo
   de 108 caracteres: no crear el socket dentro del scratchpad.
+- **Savestates y archivos**: el emulador no guarda los archivos que escribe el juego (`save/`). El cliente
+  (`Emulator.save/load`) los copia junto a cada savestate; sin eso, R tras un `load` va al save equivocado.
 - **`player` es persistente**: con `room_goto` conserva sus coordenadas. Hay que reubicarlo en
   `playerStart + (17, 23)`.
 - **Diferencias de API GM7 → GM8**: se revisaron las aridades de todas las llamadas del juego contra

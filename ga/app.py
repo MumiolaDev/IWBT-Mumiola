@@ -183,6 +183,8 @@ class Ventana(QMainWindow):
         self.f_segundos.setDecimals(0)
         self.f_segundos.setSuffix(" s")
         self.f_segundos.setValue(d.max_segundos)
+        self.f_resets = spin(0, 100, d.resets)
+        self.f_resets.setToolTip("Muertes que puede reintentar (R → último save) antes de quedar descalificado")
         self.f_workers = spin(1, os.cpu_count() or 1, d.workers)
         self.f_seed = spin(0, 1_000_000, d.seed)
         self.f_extra = QLineEdit()
@@ -197,6 +199,7 @@ class Ventana(QMainWindow):
         form.addRow("Padres (pasan como élite)", self.f_padres)
         form.addRow("Hasta la generación", self.f_generaciones)
         form.addRow("Duración del intento", self.f_segundos)
+        form.addRow("Reintentos (R al último save)", self.f_resets)
         form.addRow("Procesos en paralelo", self.f_workers)
         form.addRow("Semilla", self.f_seed)
         form.addRow("Otras opciones", self.f_extra)
@@ -233,6 +236,7 @@ class Ventana(QMainWindow):
         self.f_padres.setValue(cfg.padres)
         self.f_generaciones.setValue(cfg.generaciones)
         self.f_segundos.setValue(cfg.max_segundos)
+        self.f_resets.setValue(cfg.resets)
         self.f_seed.setValue(cfg.seed)
         self.f_extra.clear()
 
@@ -247,6 +251,7 @@ class Ventana(QMainWindow):
             "elite": self.f_padres.value(),
             "generaciones": self.f_generaciones.value(),
             "max_segundos": float(self.f_segundos.value()),
+            "resets": self.f_resets.value(),
             "workers": self.f_workers.value(),
             "seed": self.f_seed.value(),
         }
@@ -271,6 +276,14 @@ class Ventana(QMainWindow):
             if vals["padres"] == guardada.padres:  # corridas viejas (exp. 1) tienen élite distinta de padres
                 vals.pop("elite")
             vals = {k: v for k, v in vals.items() if getattr(guardada, k) != v or k == "generaciones"}
+            if "resets" in vals:
+                r = QMessageBox.question(self, "Reintentos", "Cambiar los reintentos a mitad de una corrida mezcla "
+                                         "puntajes con reglas distintas (la élite no se vuelve a evaluar). Para "
+                                         "comparar bien conviene una corrida nueva. ¿Continuar igual?")
+                if r != QMessageBox.Yes:
+                    return
+                if not guardada.save_points:  # corrida anterior a los save points: también se activan
+                    vals["save_points"] = "auto"
             if vals["generaciones"] <= hechas[-1] + 1:
                 QMessageBox.information(self, "Continuar", f"Ya tiene {hechas[-1] + 1} generaciones: "
                                         "sube «Hasta la generación».")
@@ -420,7 +433,9 @@ class Ventana(QMainWindow):
                  f"{cfg.start_room or 'rStage01'} → {cfg.sala_objetivo} · {cfg.difficulty}",
                  f"{cfg.poblacion} agentes · {cfg.padres} padres · {cfg.max_segundos:.0f} s por intento",
                  f"recompensa: {cfg.recompensa} · selección: {cfg.seleccion}",
-                 f"zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}"]
+                 f"zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}",
+                 f"reintentos: {cfg.resets} · save points: "
+                 f"{len(cfg.save_points.split(';')) if cfg.save_points and cfg.save_points != 'auto' else 0}"]
         try:
             filas = almacen.leer_metricas(carpeta)
         except (FileNotFoundError, ValueError):
@@ -432,6 +447,9 @@ class Ventana(QMainWindow):
             if "progreso_max" in u:
                 texto.append(f"camino máx: <b>{max(f['progreso_max'] for f in filas):.1f} %</b>")
                 texto.append(f"nichos: {u['nichos']:.0f}")
+            if "saves_max" in u:
+                texto.append(f"saves máx: {max(f['saves_max'] for f in filas):.0f} · "
+                             f"reintentos medios: {u['reintentos_media']:.1f}")
             texto.append(f"llegaron a la salida: {u['llegaron']:.0f}")
             texto.append(f"muertes: {u['muertes_pct']:.0f} % · vida media {u['segundos_medio']:.1f} s")
         self.resumen.setText("<br>".join(texto))

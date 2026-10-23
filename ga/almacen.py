@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .nucleo import TRAZA_DTYPE, Config, Genoma, Resultado, compactar
+from .nucleo import TRAZA_DTYPE, Config, Genoma, Resultado, compactar, completar_traza
 
 ROOT = Path(__file__).resolve().parent.parent
 CORRIDAS = ROOT / "corridas"
@@ -18,6 +18,7 @@ CAMPOS_METRICAS = [
     "pantallas_max", "pantallas_media", "llegaron", "celdas_max", "celdas_media",
     "muertes_pct", "segundos_medio", "segundos_mejor", "evaluados", "segundos_reloj",
     "progreso_max", "progreso_final_max", "progreso_media", "nichos",
+    "saves_max", "saves_media", "reintentos_media",
 ]
 
 
@@ -44,6 +45,8 @@ def guardar_generacion(carpeta: Path, gen: int, pob: list[Resultado]) -> Path:
             frame_progreso=np.array([r.frame_progreso for r in pob]),
             progreso=np.array([r.progreso for r in pob]),
             progreso_max=np.array([r.progreso_max for r in pob]),
+            muertes=np.array([r.muertes for r in pob]),
+            saves=np.array([r.saves for r in pob]),
             origen=np.array([r.origen for r in pob]),
             padres=np.array([",".join(map(str, r.padres)) for r in pob]),
             genoma_largo=largos,
@@ -67,13 +70,18 @@ def cargar_generacion(carpeta: Path, gen: int) -> list[Resultado]:
         g0 = g_fin[i] - d["genoma_largo"][i]
         t0 = t_fin[i] - d["traza_largo"][i]
         padres = tuple(int(p) for p in str(d["padres"][i]).split(",") if p)
+        genoma = Genoma(d["genoma_acciones"][g0:g_fin[i]].copy(), d["genoma_frames"][g0:g_fin[i]].copy())
+        traza = d["trazas"][t0:t_fin[i]].copy()
+        if "gen" not in traza.dtype.names:  # corrida anterior a los reintentos
+            traza = completar_traza(traza, genoma)
         pob.append(Resultado(
-            Genoma(d["genoma_acciones"][g0:g_fin[i]].copy(), d["genoma_frames"][g0:g_fin[i]].copy()),
-            float(d["fitness"][i]), bool(d["murio"][i]), int(d["frames"][i]), int(d["llego"][i]),
+            genoma, float(d["fitness"][i]), bool(d["murio"][i]), int(d["frames"][i]), int(d["llego"][i]),
             int(d["pantallas"][i]), int(d["celdas"][i]), int(d["frame_progreso"][i]),
-            d["trazas"][t0:t_fin[i]].copy(), padres, str(d["origen"][i]),
+            traza, padres, str(d["origen"][i]),
             float(d["progreso"][i]) if "progreso" in d else 0.0,
             float(d["progreso_max"][i]) if "progreso_max" in d else 0.0,
+            int(d["muertes"][i]) if "muertes" in d else 0,
+            int(d["saves"][i]) if "saves" in d else 0,
         ))
     return pob
 
@@ -88,7 +96,10 @@ def guardar_config(carpeta: Path, cfg: Config) -> None:
 
 def cargar_config(carpeta: Path) -> Config:
     d = json.loads((carpeta / "config.json").read_text())
-    d.setdefault("zonas_prohibidas", "")  # corridas anteriores a las zonas prohibidas: sin zonas
+    # Corridas anteriores a cada regla nueva: siguen con sus condiciones
+    d.setdefault("zonas_prohibidas", "")
+    d.setdefault("resets", 0)
+    d.setdefault("save_points", "")
     return Config(**d)
 
 

@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 from iwbtgb_rl import ACTIONS, IWannaBeTheGBEnv
 
 from . import almacen, recursos
-from .nucleo import FPS, ROOT, Config, Resultado, distancias, posicion_final, zonas
+from .nucleo import TECLA_R, FPS, ROOT, Config, Resultado, distancias, muertes_en, posicion_final, zonas
 
 W, H = 1920, 1080
 MAPA_W = 1440                      # el mapa ocupa la izquierda; a la derecha va el panel
@@ -160,9 +160,19 @@ def final_muerte(r: Resultado, f: int) -> bool:
 
 
 def texto_resultado(r: Resultado, cfg: Config) -> str:
+    saves = f" · {plural(r.saves, 'save')}" if cfg.save_points else ""
     if con_salida(cfg):
-        return f"fitness {r.fitness:.0f} · {100 * r.progreso:.0f} % del camino (máx {100 * r.progreso_max:.0f} %)"
-    return f"fitness {r.fitness:.1f} · {plural(r.pantallas, 'pantalla')} · {r.celdas} celdas"
+        return (f"fitness {r.fitness:.0f} · {100 * r.progreso:.0f} % del camino (máx {100 * r.progreso_max:.0f} %)"
+                + saves)
+    return f"fitness {r.fitness:.1f} · {plural(r.pantallas, 'pantalla')} · {r.celdas} celdas" + saves
+
+
+def texto_fin(r: Resultado, cfg: Config) -> str:
+    if r.llego:
+        return "llegó a " + cfg.sala_objetivo
+    if r.murio:
+        return "descalificado (sin reintentos)" if cfg.resets else "murió"
+    return f"sobrevivió {cfg.max_segundos:.0f} s" + (f" ({plural(r.muertes, 'reintento')})" if r.muertes else "")
 
 
 class Escena:
@@ -423,8 +433,7 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
     r = pob[mejor]
     dp.text((px0, 370), "Mejor de la generación", fill=DORADO, font=f_med)
     dp.text((px0, 400), texto_resultado(r, cfg), fill=TEXTO, font=f_chica)
-    fin = "llegó" if r.llego else ("murió" if r.murio else "sobrevivió")
-    dp.text((px0, 426), f"{fin} a los {tiempo(r.frames)}", fill=TEXTO, font=f_chica)
+    dp.text((px0, 426), f"{texto_fin(r, cfg)} · {tiempo(r.frames)}", fill=TEXTO, font=f_chica)
     dp.text((px0, 474), f"Mapa de {esc.nombre_room}", fill=TEXTO_2, font=f_med)
     mm_y = 508
     graf_y = mm_y + mm.base.height + 40
@@ -435,8 +444,9 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
     dp.text((px0 + 376, graf_y + 14), "media", fill=TEXTO_2, font=f_chica, anchor="lm")
     mini_grafico(dp, (px0 + 50, graf_y + 44, W - PANEL_X - 30, H - 50), metricas, gen, f_chica)
 
-    muertos = [False] * len(pob)
-    llegados = 0
+    vivo_antes = [True] * len(pob)
+    llegado = [False] * len(pob)
+    n_muertes = llegados = 0
     estela: list[tuple[float, float]] = []
     ultima = gen
     for f in list(range(0, largo, velocidad)) + [largo - 1] * FPS:
@@ -448,15 +458,17 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
                 continue
             reg = t[f]
             if not reg["alive"] or final_muerte(pob[i], f):
-                if not muertos[i] and f > 0:
-                    muertos[i] = True
+                if vivo_antes[i] and f > 0:          # acaba de morir (con reintentos, reaparece después)
+                    vivo_antes[i] = False
+                    n_muertes += 1
                     ant = t[f - 1] if not reg["alive"] else reg
                     if ant["room"] == sala:
                         cam.marcar_muerte(float(ant["x"]), float(ant["y"]) - 8)
                         mm.marcar_muerte(float(ant["x"]), float(ant["y"]) - 8)
                 continue
-            if f == len(t) - 1 and pob[i].llego and not muertos[i]:
-                muertos[i] = True
+            vivo_antes[i] = True
+            if f == len(t) - 1 and pob[i].llego and not llegado[i]:
+                llegado[i] = True
                 llegados += 1
             n_vivos += 1
             if reg["room"] == sala:
@@ -498,7 +510,7 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
         img.paste(panel, (PANEL_X, 0))
         d.text((x, 172), tiempo(min(f + 1, largo)), fill=TEXTO, font=f_grande)
         d.text((x, 266), f"{n_vivos} / {len(pob)}", fill=TEXTO, font=f_num)
-        d.text((x + 220, 266), f"{sum(muertos) - llegados}", fill=ROJO, font=f_num)
+        d.text((x + 220, 266), f"{n_muertes}", fill=ROJO, font=f_num)
         if llegados:
             d.text((x, 320), f"Llegaron a {cfg.sala_objetivo}: {llegados}", fill=AQUA, font=f_med)
         mm.dibujar(img, x, mm_y, [(float(r_["x"]), float(r_["y"])) for i, r_ in vivos_reg.items() if i != mejor],
@@ -516,31 +528,26 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
 # -- video: el mejor de una generación, jugando de verdad -------------------------------------------------
 
 def repetir(cfg: Config, r: Resultado, extra: int = FPS):
-    """Repite el genoma en el emulador dibujando cada frame. Entrega (frame RGB, registro, teclas) por frame.
-
-    Al final verifica que la repetición coincida con la traza del entrenamiento.
+    """Repite la partida en el emulador dibujando cada frame, con las teclas que quedaron en la traza (incluidos
+    los reintentos con R). Entrega (frame RGB, registro, teclas) por frame y al final verifica que la
+    repetición coincida con la traza del entrenamiento.
     """
     env = IWannaBeTheGBEnv(difficulty=cfg.difficulty, start_room=cfg.start_room, obs_type="state",
                            seed=cfg.seed_juego)
     emu = env.emu
     emu.track("player")
     emu.load(0)
-    n = len(r.traza)
-    total, distintos = 0, 0
+    distintos = 0
     try:
-        for a, k in zip(r.genoma.acciones, r.genoma.frames):
-            for _ in range(int(k)):
-                if total >= n:
-                    break
-                res = emu.step(ACTIONS[a], frames=1, obs=True, trace=True)
-                reg = res.trace[0]
-                esperado = r.traza[total]
-                if abs(float(reg["x"]) - float(esperado["x"])) > 1e-3 or abs(float(reg["y"]) - float(esperado["y"])) > 1e-3:
-                    distintos += 1
-                total += 1
-                yield res.obs, esperado, ACTIONS[a]
-            if total >= n:
-                break
+        for esperado in r.traza:
+            a = int(esperado["accion"])
+            teclas = ACTIONS[a] if a < len(ACTIONS) else (("r",) if a == TECLA_R else ())
+            res = emu.step(teclas, frames=1, obs=True, trace=True)
+            reg = res.trace[0]
+            if esperado["alive"] and (abs(float(reg["x"]) - float(esperado["x"])) > 1e-3
+                                      or abs(float(reg["y"]) - float(esperado["y"])) > 1e-3):
+                distintos += 1
+            yield res.obs, esperado, teclas
         for _ in range(extra):                       # la muerte o la llegada, sin teclas
             yield emu.step((), frames=1, obs=True).obs, None, ()
     finally:
@@ -572,9 +579,10 @@ def video_mejor(corrida: str, gen: int, salida: Path | None = None) -> Path:
     dp.text((px0, 146), "Tiempo", fill=TEXTO_2, font=f_med)
     salida_on = con_salida(cfg)
     dp.text((px0, 240), "Camino a la salida" if salida_on else "Celdas exploradas", fill=TEXTO_2, font=f_med)
-    fin = ("llegó a " + cfg.sala_objetivo if r.llego else
-           ("murió" if r.murio else f"sobrevivió {cfg.max_segundos:.0f} s"))
-    dp.text((px0, 330), f"{texto_resultado(r, cfg)} · {fin}", fill=TEXTO_2, font=f_chica)
+    dp.text((px0, 330), texto_resultado(r, cfg), fill=TEXTO_2, font=f_chica)
+    dp.text((px0, 352), texto_fin(r, cfg), fill=TEXTO_2, font=f_chica)
+    vivo = r.traza["alive"].astype(np.int8)
+    muertes_hasta = np.concatenate([[0], np.cumsum((vivo[:-1] == 1) & (vivo[1:] == 0))])
     dp.text((px0, 474), "Recorrido", fill=TEXTO_2, font=f_med)
     mm_y = 508
     graf_y = mm_y + mm.base.height + 40
@@ -617,12 +625,17 @@ def video_mejor(corrida: str, gen: int, salida: Path | None = None) -> Path:
             d.rounded_rectangle((x + bx, 384, x + bx + bw, 430), radius=8, fill=AZUL if on else (45, 45, 43),
                                 outline=AZUL if on else TEXTO_3)
             d.text((x + bx + bw / 2, 407), etiqueta, fill=TEXTO if on else TEXTO_3, font=f_tecla, anchor="mm")
+        if cfg.resets:
+            k = int(muertes_hasta[min(f, n - 1)])
+            d.text((x, 444), f"Intento {min(k + 1, cfg.resets + 1)} de {cfg.resets + 1}"
+                   + ("   · R" if "r" in teclas else ""), fill=TEXTO_2 if k == 0 else NARANJA, font=f_med)
         mm.dibujar(img, x, mm_y, [], ultimo)
         if len(recorrido) > 1:
             d.line([(x + px * mm.k, mm_y + py * mm.k) for px, py in recorrido[::2] + recorrido[-1:]],
                    fill=DORADO, width=2)
         if f >= n:
-            estado = "¡LLEGÓ!" if r.llego else ("MURIÓ" if r.murio else "SE ACABÓ EL TIEMPO")
+            estado = "¡LLEGÓ!" if r.llego else (("DESCALIFICADO" if cfg.resets else "MURIÓ") if r.murio
+                                                else "SE ACABÓ EL TIEMPO")
             d.text((MAPA_W // 2, 80), estado, fill=AQUA if r.llego else ROJO, font=fuente(72, True),
                    anchor="mm", stroke_width=4, stroke_fill=(0, 0, 0))
         video.escribir(img)
@@ -655,7 +668,7 @@ def video_evolucion(corrida: str, cada: int = 1, velocidad: int = 1, salida: Pat
     d_base = ImageDraw.Draw(base)
     f_titulo, f_med, f_chica, f_grande = fuente(48, True), fuente(26), fuente(20), fuente(40, True, True)
     g_max = max(elegidas) or 1
-    muertos = [False] * len(mejores)
+    vivo_antes = [True] * len(mejores)
     sala = cfg.room_entrenamiento
     # leyenda de color (estática)
     x = PANEL_X + 36
@@ -678,12 +691,13 @@ def video_evolucion(corrida: str, cada: int = 1, velocidad: int = 1, salida: Pat
             reg = t[f]
             col = color_gen(g / g_max)
             if not reg["alive"] or final_muerte(r, f):
-                if not muertos[k] and f > 0:
-                    muertos[k] = True
+                if vivo_antes[k] and f > 0:
+                    vivo_antes[k] = False
                     ant = t[f - 1] if not reg["alive"] else reg
                     px, py = esc.a_pantalla(float(ant["x"]), float(ant["y"]) - 8)
                     marca_muerte(d_base, px, py, color=col)
                 continue
+            vivo_antes[k] = True
             if reg["room"] != sala:
                 continue
             esc.pegar(img, reg, tinte=col, borde=col if g == elegidas[-1] else None)
@@ -784,7 +798,7 @@ def graficos(corrida: str) -> list[Path]:
     ax.legend(frameon=False, loc="center left")
     guardar(fig, "supervivencia.png")
 
-    # Mapa de muertes: dónde murió cada agente, todas las generaciones
+    # Mapa de muertes: dónde murió cada agente (todas sus muertes, con reintentos), todas las generaciones
     esc = Escena(carpeta, cfg)
     img = esc.mapa.copy().convert("RGBA")
     capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -792,11 +806,14 @@ def graficos(corrida: str) -> list[Path]:
     gens = almacen.generaciones_guardadas(carpeta)
     for gi in gens:
         for r in almacen.cargar_generacion(carpeta, gi):
-            if r.origen == "elite" or not r.murio or len(r.traza) < 2:
+            if r.origen == "elite" or len(r.traza) < 2:
                 continue
-            x, y = posicion_final(r, cfg)
-            px, py = x * esc.escala, (y - 8) * esc.escala
-            dc.ellipse((px - 6, py - 6, px + 6, py + 6), fill=(255, 70, 60, 110))
+            for f in muertes_en(r):
+                reg = r.traza[min(f, len(r.traza)) - 1]
+                if reg["room"] != cfg.room_entrenamiento:
+                    continue
+                px, py = float(reg["x"]) * esc.escala, (float(reg["y"]) - 8) * esc.escala
+                dc.ellipse((px - 6, py - 6, px + 6, py + 6), fill=(255, 70, 60, 110))
     oscuro = Image.new("RGBA", img.size, (0, 0, 0, 140))
     img = Image.alpha_composite(Image.alpha_composite(img, oscuro), capa)
     ruta = destino / "mapa_muertes.png"

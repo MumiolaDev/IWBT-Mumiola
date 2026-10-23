@@ -90,6 +90,7 @@ class Emulator:
         startup_timeout: float = 60.0,
     ):
         self.workdir = Path(tempfile.mkdtemp(prefix="iwbtgb_"))
+        self._archivos: dict[int, dict[str, bytes]] = {}
         exe = self.workdir / Path(game).name
         shutil.copy2(game, exe)
         self.socket_path = self.workdir / "rl.sock"
@@ -186,14 +187,36 @@ class Emulator:
             raise EmulatorError(f"no existe el objeto {object_name}")
 
     def save(self, slot: int = 0) -> None:
+        """Savestate del emulador. Incluye los archivos de partida que escribe el juego (`save/`), que el
+        emulador no guarda: sin ellos, cargar un savestate y apretar R llevaría al save de otra partida."""
         self._send(struct.pack("<BI", OP_SAVE, slot))
         if self._unpack("<B")[0] != STATUS_OK:
             raise EmulatorError("no se pudo guardar el savestate")
+        self._archivos[slot] = self._leer_archivos()
 
     def load(self, slot: int = 0) -> None:
         self._send(struct.pack("<BI", OP_LOAD, slot))
         if self._unpack("<B")[0] != STATUS_OK:
             raise EmulatorError(f"no existe el savestate {slot}")
+        if slot in self._archivos:
+            self._restaurar_archivos(self._archivos[slot])
+
+    # Las capturas .bmp que hace el juego al guardar solo se muestran en el menú: no se copian
+    def _leer_archivos(self) -> dict[str, bytes]:
+        carpeta = self.workdir / "save"
+        if not carpeta.is_dir():
+            return {}
+        return {p.name: p.read_bytes() for p in carpeta.iterdir() if p.is_file() and p.suffix != ".bmp"}
+
+    def _restaurar_archivos(self, archivos: dict[str, bytes]) -> None:
+        carpeta = self.workdir / "save"
+        actuales = self._leer_archivos()
+        for nombre in actuales.keys() - archivos.keys():
+            (carpeta / nombre).unlink()
+        for nombre, datos in archivos.items():
+            if actuales.get(nombre) != datos:
+                carpeta.mkdir(exist_ok=True)
+                (carpeta / nombre).write_bytes(datos)
 
     def observe(self) -> np.ndarray:
         self._send(struct.pack("<B", OP_OBS))

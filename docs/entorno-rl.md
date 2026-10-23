@@ -176,6 +176,28 @@ corrida "auto" se reemplaza por los rectángulos, así que `config.json` dice ex
 anteriores no tienen zonas (al continuarlas se puede agregar `--zonas-prohibidas auto`; `""` = ninguna). Los
 videos dibujan la zona en rojo.
 
+**Reintentos y save points** (corridas creadas desde el 2026-10-23). Al morir, entrar a una zona prohibida o
+irse de la sala, el agente espera `frames_reset` (25 frames, 0,5 s), aprieta R y el juego lo devuelve a su
+último save, como haría un jugador (R → `loadGame` → `game_restart`, 1 frame en `rInit`). Tiene `resets` (3)
+reintentos; la muerte siguiente lo descalifica. Los genes siguen desde donde iban. Todo el tiempo de espera
+cuenta dentro de `max_segundos`.
+
+- Puntaje: + `r_save` (150) por cada save point distinto activado (disparándole), − `castigo_reset` (10) por
+  reintento, − `castigo_muerte` (50) al quedar descalificado. La cercanía "al final" es la del mejor final de
+  vida (donde murió o donde lo pilló el tiempo), no la del save al que volvió.
+- `save_points` = "auto" se resuelve al crear la corrida con los `savePoint` (y sus hijos) que existen en la
+  dificultad, salvo los de zonas prohibidas. En `rStage01`, medium: 6.
+- Un save se detecta porque cambian los primeros 9 bytes (sala, x, y) de `save/saveN` en la carpeta del
+  emulador; cuál fue, por el `savePoint` con `image_index >= 1`.
+- **Los savestates del cliente incluyen los archivos de `save/`** (salvo los `.bmp`): el emulador no los guarda
+  y, sin eso, cargar un savestate y apretar R llevaría al save de otra partida. Con esto la evaluación por
+  familias sigue siendo idéntica a jugar desde cero (verificado 8 de 8 con reintentos).
+- La traza guarda por frame el gen (`gen`) y las teclas (`accion`: 0–11, 254 = espera, 255 = R). Los videos
+  repiten la partida con esas teclas. Las corridas anteriores se completan al cargarlas (sin reintentos).
+- Las mutaciones locales caen antes de una de sus muertes (cualquiera) o del mejor momento; el cruce y la rama
+  cortan por gen usando `gen`.
+- Corridas anteriores: `resets` = 0 y sin save points. Cambiar `--resets` al continuar mezcla puntajes.
+
 **Borrar corridas.** Botón "Borrar corrida…" en la app (pide confirmación y no deja borrar una corrida que esté
 usando un proceso), o `rm -r corridas/<nombre>` (borra en el disco de datos, por el enlace).
 

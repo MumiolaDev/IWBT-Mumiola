@@ -17,7 +17,7 @@ Hay dos recompensas (`Config.recompensa`):
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -45,6 +45,11 @@ class Config:
     # Rectángulos "x0,y0,x1,y1;..." (px) de la room de entrenamiento donde entrar cuenta como morir: zonas sin
     # salida que el agente no puede saber que son inútiles. "auto" = las de ZONAS_AUTO para la sala; "" = ninguna
     zonas_prohibidas: str = "auto"
+    # Reintentos: al morir (o entrar a una zona prohibida, o irse de la sala) el agente aprieta R como un jugador
+    # y el juego lo devuelve a su último save. Con `resets` reintentos usados, la siguiente muerte lo descalifica
+    resets: int = 3
+    frames_reset: int = 25             # lo que tarda en apretar R después de morir (0,5 s)
+    save_points: str = "auto"          # "x,y;..." de la sala; "auto" = los del juego, salvo los de zonas prohibidas
     # Recompensa (fitness). Solo cuenta lo que pasa en la room de entrenamiento.
     recompensa: str = "salida"         # "salida" (exp. 2) o "exploracion" (exp. 1)
     r_cercania: float = 1000.0         # salida: × fracción del camino recorrida al final (o al morir)
@@ -54,7 +59,9 @@ class Config:
     r_pantalla: float = 300.0          # por pantalla nueva (en "salida", solo las del camino a la salida)
     r_celda: float = 0.0               # por cada celda de 32x32 px visitada por primera vez
     celda: int = 32
-    castigo_muerte: float = 50.0       # salida: 5 % del camino. Morir avanzando sigue conviniendo
+    castigo_muerte: float = 50.0       # al quedar descalificado (sin reintentos). Morir avanzando sigue conviniendo
+    castigo_reset: float = 10.0        # por cada reintento usado
+    r_save: float = 150.0              # por cada save point distinto activado por primera vez (metas cortas)
     castigo_tiempo: float = 0.0        # exploracion: por segundo hasta el último progreso
     # Se resuelven al arrancar (ids de room de GameMaker)
     room_entrenamiento: int = -1
@@ -136,6 +143,8 @@ class Resultado:
     origen: str = "azar"
     progreso: float = 0.0       # salida: fracción del camino recorrida al final (1 = en la salida)
     progreso_max: float = 0.0   # salida: la mayor fracción alcanzada
+    muertes: int = 0            # reintentos usados (sin contar la muerte que lo descalifica)
+    saves: int = 0              # save points distintos activados
 
     def clave(self) -> tuple:
         return (self.fitness, -self.frame_progreso)
@@ -197,39 +206,136 @@ def frames_prohibidos(traza: np.ndarray, cfg: Config) -> np.ndarray:
     return np.nonzero(malo)[0]
 
 
+SIN_TECLAS, TECLA_R = 254, 255  # valores de `accion` en la traza que no son genes (espera y reintento)
+
+
+@dataclass
+class Estado:
+    """Lo que arrastra una partida además del emulador; se copia junto a cada savestate de familia."""
+    muertes: int = 0             # reintentos usados
+    saves: tuple = ()            # save points activados (índices de `save_points(cfg)`), en orden
+    ultimo_save: bytes = b""     # sala y posición del archivo de partida (cambia al guardar)
+
+
+def leer_save(emu) -> bytes:
+    """Sala y posición guardadas en el archivo de partida del juego (sus primeros 9 bytes)."""
+    archivos = [p for p in sorted((emu.workdir / "save").glob("save[0-9]*")) if p.suffix == ""]
+    return archivos[0].read_bytes()[:9] if archivos else b""
+
+
+@lru_cache(maxsize=8)
+def _puntos(texto: str) -> tuple:
+    return tuple(tuple(float(v) for v in z.split(",")) for z in texto.split(";") if z.strip())
+
+
+def save_points(cfg: Config) -> tuple:
+    return () if cfg.save_points == "auto" else _puntos(cfg.save_points)
+
+
+def save_activado(emu, cfg: Config, guardado: bytes) -> int:
+    """Índice del save point que se acaba de activar, o -1 si no es uno de los de la sala."""
+    puntos = save_points(cfg)
+    b = guardado
+    if not puntos or len(b) < 9 or b[0] * 10000 + b[1] * 100 + b[2] != cfg.room_entrenamiento:
+        return -1
+    # El save al que se le disparó queda con image_index >= 1 durante ~60 frames
+    s = emu.exec('with (savePoint) if (image_index >= 1) return string(x) + "," + string(y); return "";')
+    if s:
+        x, y = (float(v) for v in str(s).split(","))
+        tope = 1.0
+    else:  # no debería pasar: el más cercano a donde quedó guardado el jugador
+        x, y = b[3] * 10000 + b[4] * 100 + b[5], b[6] * 10000 + b[7] * 100 + b[8]
+        tope = 400.0
+    d = [np.hypot(px - x, py - y) for px, py in puntos]
+    k = int(np.argmin(d))
+    return k if d[k] <= tope else -1
+
+
+def muerto(base: np.ndarray, gen: int, acciones) -> np.ndarray:
+    """Registros de frames sin jugador: copias del último registro vivo, marcadas como muerto."""
+    out = np.repeat(base[None], len(acciones))
+    out["alive"] = 0
+    out["gen"] = gen
+    out["accion"] = acciones
+    return out
+
+
+def ultimo_vivo(trozos: list[np.ndarray], cfg: Config) -> np.ndarray:
+    for t in reversed(trozos):
+        k = np.nonzero((t["alive"] == 1) & (t["room"] == cfg.room_entrenamiento))[0]
+        if len(k):
+            return t[k[-1]].copy()
+    base = np.zeros((), TRAZA_DTYPE)
+    base["room"] = cfg.room_entrenamiento
+    return base
+
+
+def reaparecer(emu, cfg: Config, base: np.ndarray, gen: int, restantes: int) -> np.ndarray:
+    """El jugador tarda `frames_reset` en apretar R y el juego lo devuelve a su último save. Devuelve la traza
+    de esos frames (como muerto en `base` hasta que reaparece)."""
+    acciones = []
+    espera = min(cfg.frames_reset, restantes)
+    if espera > 0:
+        emu.step((), frames=espera, obs=False, no_draw=True)
+        acciones += [SIN_TECLAS] * espera
+    if len(acciones) < restantes:
+        emu.step(("r",), frames=1, obs=False, no_draw=True)
+        acciones.append(TECLA_R)
+    trozos = [muerto(base, gen, acciones)]
+    n = len(acciones)
+    while n < restantes and n < len(acciones) + 100:  # el juego pasa por rInit y vuelve a la sala del save
+        r = emu.step((), frames=1, obs=False, trace=True, no_draw=True)
+        t = compactar(r.trace, gen, SIN_TECLAS)
+        n += 1
+        if len(t) and t[0]["room"] == cfg.room_entrenamiento and t[0]["alive"]:
+            trozos.append(t)
+            break
+        trozos.append(muerto(base, gen, [SIN_TECLAS]))
+    return np.concatenate(trozos)
+
+
 def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0, guardar: dict | None = None,
-          hasta: int | None = None):
+          hasta: int | None = None, estado: Estado | None = None):
     """Ejecuta los genes desde el índice `desde` (estando el juego en el frame `frame0`).
 
     `guardar` = {índice de gen: slot}: guarda un savestate justo antes de ejecutar ese gen y anota en
-    `puntos` el frame y cuántos trozos de traza había. `hasta` detiene la ejecución antes de ese gen.
-    Devuelve (genoma, trozos de traza, murió, puntos).
+    `puntos` el frame, cuántos trozos de traza había y el estado. `hasta` detiene la ejecución antes de ese gen.
+    Al morir usa un reintento (R → último save) mientras le queden.
+    Devuelve (genoma, trozos de traza, descalificado, puntos, estado).
     """
     max_frames = cfg.max_frames
     trozos, total, i, murio = [], frame0, desde, False
     puntos = {}
+    estado = replace(estado) if estado is not None else Estado(ultimo_save=leer_save(emu))
     meta = cfg.room_objetivo
     while total < max_frames:
         if hasta is not None and i >= hasta:
             break
         if guardar and i in guardar:
             emu.save(guardar[i])
-            puntos[i] = (guardar[i], total, len(trozos))
+            puntos[i] = (guardar[i], total, len(trozos), replace(estado))
         if i >= len(genoma):
             genoma = concatenar(genoma, genes_al_azar(rng, 64, cfg))
+        a = int(genoma.acciones[i])
         frames = min(int(genoma.frames[i]), max_frames - total)
-        r = emu.step(ACTIONS[genoma.acciones[i]], frames=frames, obs=False, trace=True, no_draw=True,
-                     stop_on_gone=True)
-        traza = compactar(r.trace)
+        r = emu.step(ACTIONS[a], frames=frames, obs=False, trace=True, no_draw=True, stop_on_gone=True)
+        traza = compactar(r.trace, i, a)
         i += 1
         llego = np.nonzero(traza["room"] == meta)[0]
         fuera = frames_prohibidos(traza, cfg)
+        cae = False
         if len(fuera) and (not len(llego) or fuera[0] < llego[0]):
-            # Se fue a otra room o entró a una zona prohibida: termina como si hubiera muerto justo antes
-            trozos.append(traza[: fuera[0]])
-            total += fuera[0]
-            murio = True
-            break
+            # Se fue a otra room o entró a una zona prohibida: cuenta como morir justo antes
+            cae = True
+            if estado.muertes >= cfg.resets:
+                trozos.append(traza[: fuera[0]])
+                total += fuera[0]
+                murio = True
+                break
+            # El resto del gen igual se jugó (el emulador avanzó): queda como muerto en el último lugar válido
+            base = ultimo_vivo(trozos + [traza[: fuera[0]]], cfg)
+            traza = np.concatenate([traza[: fuera[0]], muerto(base, i - 1, traza["accion"][fuera[0]:])])
+            llego = llego[:0]
         if len(llego):
             trozos.append(traza[: llego[0] + 1])
             total += llego[0] + 1
@@ -237,16 +343,30 @@ def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0
         trozos.append(traza)
         total += len(traza)
         if len(traza) == 0 or not traza[-1]["alive"] or r.ended:
-            murio = True
-            break
-    return genoma, trozos, murio, puntos
+            cae = True
+        guardado = leer_save(emu)
+        if guardado != estado.ultimo_save:
+            estado.ultimo_save = guardado
+            k = save_activado(emu, cfg, guardado)
+            if k >= 0 and k not in estado.saves:
+                estado.saves += (k,)
+        if cae:
+            if r.ended or estado.muertes >= cfg.resets:
+                murio = True
+                break
+            estado.muertes += 1
+            if total < max_frames:
+                vuelta = reaparecer(emu, cfg, ultimo_vivo(trozos, cfg), i - 1, max_frames - total)
+                trozos.append(vuelta)
+                total += len(vuelta)
+    return genoma, trozos, murio, puntos, estado
 
 
 def evaluar(env: IWannaBeTheGBEnv, cfg: Config, genoma: Genoma, semilla: int, padres=(), origen="azar") -> Resultado:
     """Evalúa un genoma desde el inicio de la sala."""
     env.emu.load(0)
-    genoma, trozos, murio, _ = jugar(env.emu, cfg, genoma, np.random.default_rng(semilla))
-    return puntuar(cfg, genoma, unir(trozos), murio, padres, origen)
+    genoma, trozos, murio, _, estado = jugar(env.emu, cfg, genoma, np.random.default_rng(semilla))
+    return puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado)
 
 
 def primer_gen_distinto(a: Genoma, b: Genoma) -> int:
@@ -266,22 +386,22 @@ def evaluar_familia(env: IWannaBeTheGBEnv, cfg: Config, padre: Genoma | None, hi
     if candidatos:
         emu.load(0)
         guardar = {k: slot + 1 for slot, k in enumerate(candidatos)}
-        _, prefijo, _, puntos = jugar(emu, cfg, padre, np.random.default_rng(0), guardar=guardar,
-                                      hasta=candidatos[-1] + 1)
+        _, prefijo, _, puntos, _ = jugar(emu, cfg, padre, np.random.default_rng(0), guardar=guardar,
+                                         hasta=candidatos[-1] + 1)
     resultados = []
     for (genoma, semilla, padres, origen), k in zip(hijos, ks):
         usables = [j for j in puntos if j <= k]
         rng = np.random.default_rng(semilla)
         if usables:
             j = max(usables)
-            slot, frame0, n_trozos = puntos[j]
+            slot, frame0, n_trozos, estado0 = puntos[j]
             emu.load(slot)
-            genoma, trozos, murio, _ = jugar(emu, cfg, genoma, rng, desde=j, frame0=frame0)
+            genoma, trozos, murio, _, estado = jugar(emu, cfg, genoma, rng, desde=j, frame0=frame0, estado=estado0)
             trozos = prefijo[:n_trozos] + trozos
         else:
             emu.load(0)
-            genoma, trozos, murio, _ = jugar(emu, cfg, genoma, rng)
-        resultados.append(puntuar(cfg, genoma, unir(trozos), murio, padres, origen))
+            genoma, trozos, murio, _, estado = jugar(emu, cfg, genoma, rng)
+        resultados.append(puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado))
     return resultados
 
 
@@ -293,11 +413,15 @@ def unir(trozos: list[np.ndarray]) -> np.ndarray:
 TRAZA_DTYPE = np.dtype([
     ("room", "<i2"), ("alive", "u1"), ("x", "<f4"), ("y", "<f4"),
     ("sprite", "<i2"), ("image", "u1"), ("xscale", "i1"),
+    ("gen", "<u2"),     # gen que se jugaba en ese frame
+    ("accion", "u1"),   # teclas de ese frame: índice de ACTIONS, SIN_TECLAS o TECLA_R
 ])
 
 
-def compactar(traza: np.ndarray) -> np.ndarray:
+def compactar(traza: np.ndarray, gen: int = 0, accion: int = 254) -> np.ndarray:
     out = np.zeros(len(traza), TRAZA_DTYPE)
+    out["gen"] = gen
+    out["accion"] = accion
     out["room"] = traza["room"]
     out["alive"] = traza["alive"]
     out["x"] = traza["x"]
@@ -308,9 +432,24 @@ def compactar(traza: np.ndarray) -> np.ndarray:
     return out
 
 
-def puntuar(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar") -> Resultado:
+def completar_traza(traza: np.ndarray, genoma: Genoma) -> np.ndarray:
+    """Traza de una corrida anterior a los reintentos (sin `gen` ni `accion`): se deducen del genoma."""
+    out = np.zeros(len(traza), TRAZA_DTYPE)
+    for k in traza.dtype.names:
+        out[k] = traza[k]
+    if len(genoma):
+        g = np.searchsorted(np.cumsum(genoma.frames.astype(np.int64)), np.arange(len(traza)), side="right")
+        g = np.minimum(g, len(genoma) - 1)
+        out["gen"] = g
+        out["accion"] = genoma.acciones[g]
+    return out
+
+
+def puntuar(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar",
+            estado: Estado | None = None) -> Resultado:
+    estado = estado or Estado()
     if cfg.recompensa == "salida":
-        return puntuar_salida(cfg, genoma, traza, murio, padres, origen)
+        return puntuar_salida(cfg, genoma, traza, murio, padres, origen, estado)
     en_sala = np.nonzero((traza["alive"] == 1) & (traza["room"] == cfg.room_entrenamiento))[0]
     # Fuera de los bordes (p. ej. dentro del hueco del techo) cuenta como el borde: no es una pantalla nueva
     x = np.clip(np.floor(traza["x"][en_sala]).astype(np.int64), 0, cfg.room_ancho - 1)
@@ -329,13 +468,15 @@ def puntuar(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=
     fitness = (
         cfg.r_pantalla * max(0, n_pantallas - 1)
         + cfg.r_celda * n_celdas
+        + cfg.r_save * len(estado.saves)
+        - cfg.castigo_reset * estado.muertes
         - (cfg.castigo_muerte if murio else 0.0)
         - cfg.castigo_tiempo * frame_progreso / FPS
     )
     if llego:
         fitness += cfg.r_objetivo + cfg.r_tiempo * (cfg.max_frames - len(traza)) / FPS
     return Resultado(genoma, float(fitness), murio, len(traza), int(llego), n_pantallas, n_celdas, frame_progreso,
-                     traza, tuple(padres), origen)
+                     traza, tuple(padres), origen, muertes=estado.muertes, saves=len(estado.saves))
 
 
 _mapas: dict[str, dict] = {}
@@ -359,9 +500,12 @@ def distancias(cfg: Config, x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return dist[j, i]
 
 
-def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar") -> Resultado:
+def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar",
+                   estado: Estado | None = None) -> Resultado:
     """Fitness por cercanía a la salida: r_cercania × progreso final + r_avance × mejor progreso
-    + r_pantalla por pantalla del camino alcanzada − castigo por morir (+ premio si llega)."""
+    + r_pantalla por pantalla del camino alcanzada + r_save por save point nuevo − castigos por reintento y por
+    quedar descalificado (+ premio si llega)."""
+    estado = estado or Estado()
     mapa = mapa_distancia(cfg)
     d0 = float(mapa["d0"])
     en_sala = np.nonzero((traza["alive"] == 1) & (traza["room"] == cfg.room_entrenamiento))[0]
@@ -374,7 +518,10 @@ def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, 
     llego = len(traza) > 0 and int(traza["room"][-1]) == cfg.room_objetivo
     if len(en_sala):
         d = distancias(cfg, x, y)
-        progreso = 1.0 - float(d[-1]) / d0
+        # Cercanía "al final": con reintentos, el mejor final de vida (donde murió o donde lo pilló el tiempo),
+        # no el save al que volvió. Con una sola vida es la posición final
+        fin_vida = np.nonzero(np.diff(en_sala) != 1)[0]
+        progreso = 1.0 - float(min(d[-1], d[fin_vida].min() if len(fin_vida) else np.inf)) / d0
         k = int(np.argmin(d))
         progreso_max = 1.0 - float(d[k]) / d0
         frame_progreso = int(en_sala[k])
@@ -389,12 +536,14 @@ def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, 
         + cfg.r_avance * progreso_max
         + cfg.r_pantalla * max(0, len(pantallas & ruta) - 1)
         + cfg.r_celda * n_celdas
+        + cfg.r_save * len(estado.saves)
+        - cfg.castigo_reset * estado.muertes
         - (cfg.castigo_muerte if murio else 0.0)
     )
     if llego:
         fitness += cfg.r_objetivo + cfg.r_tiempo * (cfg.max_frames - len(traza)) / FPS
     return Resultado(genoma, float(fitness), murio, len(traza), int(llego), len(pantallas), n_celdas, frame_progreso,
-                     traza, tuple(padres), origen, progreso, progreso_max)
+                     traza, tuple(padres), origen, progreso, progreso_max, estado.muertes, len(estado.saves))
 
 
 def posicion_final(r: Resultado, cfg: Config) -> tuple[float, float]:
@@ -410,6 +559,22 @@ def posicion_final(r: Resultado, cfg: Config) -> tuple[float, float]:
 def nicho(r: Resultado, cfg: Config) -> tuple:
     x, y = posicion_final(r, cfg)
     return (int(r.llego), int(x // cfg.nicho_px), int(y // cfg.nicho_px))
+
+
+def resolver_saves(cfg: Config) -> None:
+    """Reemplaza "auto" por los save points de la sala (los que existen en esta dificultad), salvo los que
+    caen en zonas prohibidas."""
+    if cfg.save_points != "auto":
+        return
+    env = IWannaBeTheGBEnv(difficulty=cfg.difficulty, start_room=cfg.start_room, obs_type="state",
+                           seed=cfg.seed_juego)
+    try:
+        s = env.emu.exec('var s; s = ""; with (savePoint) s += string(x) + "," + string(y) + ";"; return s;')
+    finally:
+        env.close()
+    puntos = [p for p in _puntos(str(s))
+              if not any(x0 <= p[0] < x1 and y0 <= p[1] < y1 for x0, y0, x1, y1 in zonas(cfg))]
+    cfg.save_points = ";".join(f"{x:g},{y:g}" for x, y in puntos)
 
 
 def resolver_rooms(cfg: Config) -> None:
@@ -441,32 +606,29 @@ def torneo(rng: np.random.Generator, pob: list[Resultado], k: int) -> int:
     return int(max(idx, key=lambda i: pob[i].clave()))
 
 
-def cortar_en_frame(g: Genoma, frame: int) -> tuple[Genoma, Genoma]:
-    """Parte el genoma en el frame dado (dividiendo el gen que lo cruza)."""
-    inicios = g.inicios()
-    if frame >= int(g.frames.astype(np.int64).sum()):
-        return g.copia(), Genoma(g.acciones[:0], g.frames[:0])
-    i = int(np.searchsorted(inicios, frame, side="right")) - 1
-    if i < 0:
-        return Genoma(g.acciones[:0], g.frames[:0]), g.copia()
-    dentro = frame - int(inicios[i])
-    a = Genoma(g.acciones[:i].copy(), g.frames[:i].copy())
-    b = Genoma(g.acciones[i:].copy(), g.frames[i:].copy())
-    if dentro > 0:
-        a = concatenar(a, Genoma(b.acciones[:1].copy(), np.array([dentro], np.uint8)))
-        b.frames[0] -= dentro
-        if b.frames[0] == 0:
-            b = Genoma(b.acciones[1:], b.frames[1:])
-    return a, b
+def gen_en_frame(r: Resultado, t: int) -> int:
+    """Índice del gen que se jugaba en el frame t (con reintentos no coincide con la suma de duraciones)."""
+    if len(r.traza) == 0:
+        return 0
+    return int(r.traza["gen"][min(max(t, 0), len(r.traza) - 1)])
+
+
+def muertes_en(r: Resultado) -> list[int]:
+    """Frames en que murió (o se cortó la partida por descalificación)."""
+    vivo = r.traza["alive"].astype(np.int8)
+    fallas = (np.nonzero((vivo[:-1] == 1) & (vivo[1:] == 0))[0] + 1).tolist()
+    if r.murio and (not fallas or fallas[-1] < r.frames - 1):
+        fallas.append(r.frames)
+    return fallas
 
 
 def cruzar(rng: np.random.Generator, a: Resultado, b: Resultado) -> Genoma:
-    """Cruce en un punto del tiempo: la partida de A hasta el frame t y desde ahí las entradas de B."""
+    """Cruce en un punto del tiempo: los genes de A hasta el frame t y desde ahí los de B."""
     limite = max(1, min(a.frames, b.frames))
     t = int(rng.integers(1, limite + 1))
-    pre, _ = cortar_en_frame(a.genoma, t)
-    _, post = cortar_en_frame(b.genoma, t)
-    return concatenar(pre, post)
+    ga, gb = gen_en_frame(a, t), gen_en_frame(b, t)
+    return concatenar(Genoma(a.genoma.acciones[:ga].copy(), a.genoma.frames[:ga].copy()),
+                      Genoma(b.genoma.acciones[gb:].copy(), b.genoma.frames[gb:].copy()))
 
 
 def genes_usados(g: Genoma, frames: int) -> int:
@@ -490,24 +652,25 @@ def mutar(rng: np.random.Generator, padre: Resultado, cfg: Config) -> Genoma:
     modo = int(rng.choice(3, p=pesos / pesos.sum())) if pesos.sum() > 0 else 0
     if modo == 2:
         t = int(rng.integers(max(1, int(0.2 * jugados)), jugados + 1))
-        pre, _ = cortar_en_frame(g, t)
-        return concatenar(pre, genes_al_azar(rng, cfg.genes_iniciales, cfg))
+        k = gen_en_frame(padre, t)
+        return concatenar(Genoma(g.acciones[:k], g.frames[:k]), genes_al_azar(rng, cfg.genes_iniciales, cfg))
 
     # 1) a veces, además, un cambio en cualquier punto de la partida (explora rutas alternativas)
     if rng.random() < cfg.prob_mut_global and len(acciones) > 1:
-        i = int(rng.integers(0, genes_usados(g, jugados)))
+        i = int(rng.integers(0, min(len(acciones), gen_en_frame(padre, jugados) + 1)))
         acciones[i] = otra_accion(rng, int(acciones[i]))
 
-    # 2) mutaciones concentradas en una ventana: antes del final (muerte) o del mejor momento (local),
+    # 2) mutaciones concentradas en una ventana: antes de una de sus muertes o del mejor momento (local),
     #    o en un momento al azar (punto)
+    fallas = muertes_en(padre)
     if modo == 1:
         fin = int(rng.integers(1, jugados + 1))
     else:
-        fin = padre.frames if padre.murio else padre.frame_progreso + 1
+        fin = int(rng.choice(fallas)) if fallas else padre.frame_progreso + 1
     ventana = int(cfg.ventana_muerte_s * FPS * rng.uniform(0.5, 1.5))
     t0 = max(0, fin - ventana)
-    inicios = np.concatenate([[0], np.cumsum(np.array(frames, np.int64))[:-1]]) if frames else np.zeros(0, np.int64)
-    candidatos = [i for i in range(len(acciones)) if t0 <= inicios[i] < max(fin, 1)]
+    en_ventana = np.unique(padre.traza["gen"][t0:max(fin, 1)]) if len(padre.traza) else []
+    candidatos = [int(i) for i in en_ventana if i < len(acciones)]
     if not candidatos:
         candidatos = [max(0, len(acciones) - 1)]
     n = int(rng.integers(cfg.mut_ventana_min, cfg.mut_ventana_max + 1))
