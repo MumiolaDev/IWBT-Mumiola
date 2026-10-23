@@ -167,6 +167,18 @@ la sala objetivo. Queda en `corridas/<nombre>/distancia.npz` (más `graficos/map
 "pantallas del camino" son las que cruza el camino más corto: en `rStage01` la de arriba a la derecha (hub
 de warps cerrados) no cuenta.
 
+**Zonas prohibidas.** `zonas_prohibidas` ("x0,y0,x1,y1;..." en px de la room de entrenamiento) marca zonas sin
+salida donde entrar cuenta como morir, igual que irse a otra room: la traza se corta justo antes de entrar. Con
+"auto" (por defecto) se usan las de `ZONAS_AUTO` en `ga/nucleo.py`; hoy solo `rStage01`: la pantalla de
+arriba a la derecha (800,0)–(1600,608), la sala de portales que abren los jefes, donde en la corrida
+`150AStage01_00` se quedaban vivos 47 de 150 agentes (ocupaban muchos nichos con fitness ~55). Al crear la
+corrida "auto" se reemplaza por los rectángulos, así que `config.json` dice exactamente qué se usó. Las corridas
+anteriores no tienen zonas (al continuarlas se puede agregar `--zonas-prohibidas auto`; `""` = ninguna). Los
+videos dibujan la zona en rojo.
+
+**Borrar corridas.** Botón "Borrar corrida…" en la app (pide confirmación y no deja borrar una corrida que esté
+usando un proceso), o `rm -r corridas/<nombre>` (borra en el disco de datos, por el enlace).
+
 **Nichos.** Dos agentes que terminan (mueren o se les acaba el tiempo) en el mismo cuadro de 64 px son del
 mismo nicho; solo el mejor de cada nicho puede ser padre.
 

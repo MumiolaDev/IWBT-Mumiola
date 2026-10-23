@@ -22,7 +22,7 @@ import numpy as np
 
 from . import almacen
 from .nucleo import (Config, Resultado, cruzar, evaluar_en_worker, genes_al_azar, genes_usados, iniciar_worker, mutar,
-                     nicho, resolver_rooms, torneo)
+                     nicho, resolver_rooms, resolver_zonas, torneo)
 
 
 def resumen(gen: int, pob: list[Resultado], evaluados: int, reloj: float, cfg: Config) -> dict:
@@ -194,13 +194,14 @@ def main():
             setattr(cfg, f.name, v)
     if cfg.room_entrenamiento < 0:
         resolver_rooms(cfg)
+    resolver_zonas(cfg)
     carpeta.mkdir(parents=True, exist_ok=True)
     almacen.guardar_config(carpeta, cfg)
 
     rng = np.random.default_rng(cfg.seed + 1000 * (hechas[-1] + 1 if hechas else 0))
     print(f"corrida {carpeta}  población {cfg.poblacion}  workers {cfg.workers}  "
           f"tope {cfg.max_segundos:.0f} s de juego  room {cfg.room_entrenamiento} -> {cfg.sala_objetivo} "
-          f"({cfg.room_objetivo})", flush=True)
+          f"({cfg.room_objetivo})  zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}", flush=True)
 
     inicio_total = time.time()
     with mp.get_context("spawn").Pool(cfg.workers, initializer=iniciar_worker, initargs=(cfg,)) as pool:

@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 from iwbtgb_rl import ACTIONS, IWannaBeTheGBEnv
 
 from . import almacen, recursos
-from .nucleo import FPS, ROOT, Config, Resultado, distancias, posicion_final
+from .nucleo import FPS, ROOT, Config, Resultado, distancias, posicion_final, zonas
 
 W, H = 1920, 1080
 MAPA_W = 1440                      # el mapa ocupa la izquierda; a la derecha va el panel
@@ -131,15 +131,21 @@ def con_salida(cfg: Config) -> bool:
 
 
 def marcar_salida(img: Image.Image, cfg: Config) -> Image.Image:
-    """Dibuja la salida (recuadro aqua + "SALIDA") sobre la imagen completa de la room."""
-    if not con_salida(cfg):
+    """Dibuja la salida (recuadro aqua + "SALIDA") y las zonas prohibidas sobre la imagen completa de la room."""
+    rects = zonas(cfg)
+    if not con_salida(cfg) and not rects:
         return img
     from . import distancia
-    mapa = distancia.cargar(ROOT / cfg.mapa_distancia)
     img = img.copy()
     capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(capa)
-    for x0, y0, x1, y1 in mapa["salidas"]:
+    for x0, y0, x1, y1 in rects:
+        x1, y1 = min(img.width, x1) - 1, min(img.height, y1) - 1
+        d.rectangle((x0, y0, x1, y1), fill=(220, 40, 40, 45), outline=(220, 40, 40, 200), width=4)
+        d.text(((x0 + x1) / 2, y1 - 12), "ZONA PROHIBIDA (cuenta como muerte)", fill=(255, 90, 90, 255),
+               font=fuente(18, True), anchor="mb", stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    salidas = distancia.cargar(ROOT / cfg.mapa_distancia)["salidas"] if con_salida(cfg) else []
+    for x0, y0, x1, y1 in salidas:
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(img.width - 1, x1), min(img.height - 1, y1)
         d.rectangle((x0, y0, x1, y1), fill=(*AQUA, 110), outline=(*AQUA, 255), width=3)

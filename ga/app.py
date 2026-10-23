@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -103,6 +104,8 @@ class Ventana(QMainWindow):
         b_act.clicked.connect(self.actualizar_lista)
         b_carpeta = QPushButton("Abrir carpeta")
         b_carpeta.clicked.connect(lambda: self.abrir(""))
+        b_borrar = QPushButton("Borrar corrida…")
+        b_borrar.clicked.connect(self.borrar)
         self.resumen = QLabel()
         self.resumen.setWordWrap(True)
         self.resumen.setAlignment(Qt.AlignTop)
@@ -114,6 +117,7 @@ class Ventana(QMainWindow):
         for b in (b_nueva, b_act, b_carpeta):
             fila.addWidget(b)
         izq.addLayout(fila)
+        izq.addWidget(b_borrar)
         caja = QGroupBox("Resumen")
         QVBoxLayout(caja).addWidget(self.resumen)
         izq.addWidget(caja, 1)
@@ -415,7 +419,8 @@ class Ventana(QMainWindow):
         texto = [f"<b>{nombre}</b>",
                  f"{cfg.start_room or 'rStage01'} → {cfg.sala_objetivo} · {cfg.difficulty}",
                  f"{cfg.poblacion} agentes · {cfg.padres} padres · {cfg.max_segundos:.0f} s por intento",
-                 f"recompensa: {cfg.recompensa} · selección: {cfg.seleccion}"]
+                 f"recompensa: {cfg.recompensa} · selección: {cfg.seleccion}",
+                 f"zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}"]
         try:
             filas = almacen.leer_metricas(carpeta)
         except (FileNotFoundError, ValueError):
@@ -430,6 +435,27 @@ class Ventana(QMainWindow):
             texto.append(f"llegaron a la salida: {u['llegaron']:.0f}")
             texto.append(f"muertes: {u['muertes_pct']:.0f} % · vida media {u['segundos_medio']:.1f} s")
         self.resumen.setText("<br>".join(texto))
+
+    def borrar(self) -> None:
+        nombre = self.corrida_actual()
+        if not nombre:
+            return
+        if any(nombre in p.args for p in self.procesos):
+            QMessageBox.information(self, "Borrar", f"Hay un proceso usando «{nombre}»: detenlo primero.")
+            return
+        carpeta = almacen.dir_corrida(nombre)
+        n = len(almacen.generaciones_guardadas(carpeta))
+        mb = sum(f.stat().st_size for f in carpeta.rglob("*") if f.is_file()) / 1e6
+        r = QMessageBox.question(self, "Borrar corrida", f"¿Borrar «{nombre}» ({n} generaciones, {mb:.0f} MB) "
+                                 "con sus videos y gráficos?\n\nNo se puede deshacer.",
+                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        shutil.rmtree(carpeta)
+        (almacen.CORRIDAS / f"{nombre}.log").unlink(missing_ok=True)
+        self.log.appendPlainText(f"borrada la corrida {nombre} ({mb:.0f} MB)")
+        self.lista.setCurrentItem(None)
+        self.actualizar_lista()
 
     def abrir(self, sub: str) -> None:
         nombre = self.corrida_actual()

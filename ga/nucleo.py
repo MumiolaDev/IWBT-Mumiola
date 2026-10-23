@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,9 @@ class Config:
     max_segundos: float = 60.0         # 1 minuto de juego (3000 frames a 50 FPS)
     sala_objetivo: str = "rStage02"    # llegar aquí completa el episodio
     salir_es_muerte: bool = True       # irse a otra room (p. ej. rStage07 por el techo) cuenta como morir
+    # Rectángulos "x0,y0,x1,y1;..." (px) de la room de entrenamiento donde entrar cuenta como morir: zonas sin
+    # salida que el agente no puede saber que son inútiles. "auto" = las de ZONAS_AUTO para la sala; "" = ninguna
+    zonas_prohibidas: str = "auto"
     # Recompensa (fitness). Solo cuenta lo que pasa en la room de entrenamiento.
     recompensa: str = "salida"         # "salida" (exp. 2) o "exploracion" (exp. 1)
     r_cercania: float = 1000.0         # salida: × fracción del camino recorrida al final (o al morir)
@@ -161,6 +165,38 @@ def evaluar_en_worker(args) -> list[Resultado]:
     return evaluar_familia(_env, _cfg, padre, hijos)
 
 
+# Zonas sin salida conocidas, por sala de entrenamiento
+ZONAS_AUTO = {
+    "rStage01": "800,0,1600,608",  # pantalla de arriba a la derecha: sala de portales que abren los jefes
+}
+
+
+def resolver_zonas(cfg: Config) -> None:
+    """Reemplaza "auto" por los rectángulos de la sala, para que config.json diga exactamente qué se usó."""
+    if cfg.zonas_prohibidas == "auto":
+        cfg.zonas_prohibidas = ZONAS_AUTO.get(cfg.start_room or "rStage01", "")
+
+
+@lru_cache(maxsize=8)
+def _rectangulos(texto: str) -> tuple:
+    return tuple(tuple(float(v) for v in z.split(",")) for z in texto.split(";") if z.strip())
+
+
+def zonas(cfg: Config) -> tuple:
+    return () if cfg.zonas_prohibidas == "auto" else _rectangulos(cfg.zonas_prohibidas)
+
+
+def frames_prohibidos(traza: np.ndarray, cfg: Config) -> np.ndarray:
+    """Frames en que el jugador se fue a otra room que no es la objetivo o entró a una zona prohibida."""
+    malo = np.zeros(len(traza), bool)
+    if cfg.salir_es_muerte:
+        malo |= (traza["room"] != cfg.room_objetivo) & (traza["room"] != cfg.room_entrenamiento)
+    en_sala = traza["room"] == cfg.room_entrenamiento
+    for x0, y0, x1, y1 in zonas(cfg):
+        malo |= en_sala & (traza["x"] >= x0) & (traza["x"] < x1) & (traza["y"] >= y0) & (traza["y"] < y1)
+    return np.nonzero(malo)[0]
+
+
 def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0, guardar: dict | None = None,
           hasta: int | None = None):
     """Ejecuta los genes desde el índice `desde` (estando el juego en el frame `frame0`).
@@ -187,14 +223,13 @@ def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0
         traza = compactar(r.trace)
         i += 1
         llego = np.nonzero(traza["room"] == meta)[0]
-        if cfg.salir_es_muerte:
-            fuera = np.nonzero((traza["room"] != meta) & (traza["room"] != cfg.room_entrenamiento))[0]
-            if len(fuera) and (not len(llego) or fuera[0] < llego[0]):
-                # Se fue a otra room: termina como si hubiera muerto en el último frame dentro de la sala
-                trozos.append(traza[: fuera[0]])
-                total += fuera[0]
-                murio = True
-                break
+        fuera = frames_prohibidos(traza, cfg)
+        if len(fuera) and (not len(llego) or fuera[0] < llego[0]):
+            # Se fue a otra room o entró a una zona prohibida: termina como si hubiera muerto justo antes
+            trozos.append(traza[: fuera[0]])
+            total += fuera[0]
+            murio = True
+            break
         if len(llego):
             trozos.append(traza[: llego[0] + 1])
             total += llego[0] + 1

@@ -87,7 +87,9 @@ def guardar_config(carpeta: Path, cfg: Config) -> None:
 
 
 def cargar_config(carpeta: Path) -> Config:
-    return Config(**json.loads((carpeta / "config.json").read_text()))
+    d = json.loads((carpeta / "config.json").read_text())
+    d.setdefault("zonas_prohibidas", "")  # corridas anteriores a las zonas prohibidas: sin zonas
+    return Config(**d)
 
 
 def agregar_metricas(carpeta: Path, fila: dict) -> None:
