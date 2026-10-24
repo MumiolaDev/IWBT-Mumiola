@@ -192,25 +192,25 @@ class Emulator:
         self._send(struct.pack("<BI", OP_SAVE, slot))
         if self._unpack("<B")[0] != STATUS_OK:
             raise EmulatorError("no se pudo guardar el savestate")
-        self._archivos[slot] = self._leer_archivos()
+        self._archivos[slot] = self.archivos()
 
     def load(self, slot: int = 0) -> None:
         self._send(struct.pack("<BI", OP_LOAD, slot))
         if self._unpack("<B")[0] != STATUS_OK:
             raise EmulatorError(f"no existe el savestate {slot}")
         if slot in self._archivos:
-            self._restaurar_archivos(self._archivos[slot])
+            self.restaurar_archivos(self._archivos[slot])
 
     # Las capturas .bmp que hace el juego al guardar solo se muestran en el menú: no se copian
-    def _leer_archivos(self) -> dict[str, bytes]:
+    def archivos(self) -> dict[str, bytes]:
         carpeta = self.workdir / "save"
         if not carpeta.is_dir():
             return {}
         return {p.name: p.read_bytes() for p in carpeta.iterdir() if p.is_file() and p.suffix != ".bmp"}
 
-    def _restaurar_archivos(self, archivos: dict[str, bytes]) -> None:
+    def restaurar_archivos(self, archivos: dict[str, bytes]) -> None:
         carpeta = self.workdir / "save"
-        actuales = self._leer_archivos()
+        actuales = self.archivos()
         for nombre in actuales.keys() - archivos.keys():
             (carpeta / nombre).unlink()
         for nombre, datos in archivos.items():

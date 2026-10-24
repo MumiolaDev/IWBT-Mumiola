@@ -50,6 +50,9 @@ class Config:
     resets: int = 3
     frames_reset: int = 25             # lo que tarda en apretar R después de morir (0,5 s)
     save_points: str = "auto"          # "x,y;..." de la sala; "auto" = los del juego, salvo los de zonas prohibidas
+    # Save heredado: cada hijo de un padre que activó un save point nuevo parte, con esta probabilidad, desde ese
+    # save (como un jugador que guardó: R lo deja ahí), con el tiempo y los reintentos completos
+    prob_desde_save: float = 0.3
     # Recompensa (fitness). Solo cuenta lo que pasa en la room de entrenamiento.
     recompensa: str = "salida"         # "salida" (exp. 2) o "exploracion" (exp. 1)
     r_cercania: float = 1000.0         # salida: × fracción del camino recorrida al final (o al morir)
@@ -128,6 +131,19 @@ def concatenar(a: Genoma, b: Genoma) -> Genoma:
     return Genoma(np.concatenate([a.acciones, b.acciones]), np.concatenate([a.frames, b.frames]))
 
 
+@dataclass(frozen=True)
+class Inicio:
+    """Save point desde el que parte un agente (heredado de un ancestro que lo activó). Sin Inicio, la partida
+    empieza al comienzo de la sala."""
+    save: int                    # índice en `save_points(cfg)`
+    archivos: tuple              # ((nombre, bytes), ...): la carpeta save/ del juego justo después de guardar
+    saves: tuple                 # save points ya activados por los ancestros (este incluido), en orden
+    pantallas: tuple             # pantallas del camino a la salida ya recorridas por los ancestros
+    gen: int                     # generación e índice del agente que lo activó (para el video del recorrido
+    agente: int                  # completo, tramo por tramo)
+    frame: int                   # frame de esa partida en que lo activó (fin del gen)
+
+
 @dataclass(eq=False)
 class Resultado:
     genoma: Genoma
@@ -144,7 +160,9 @@ class Resultado:
     progreso: float = 0.0       # salida: fracción del camino recorrida al final (1 = en la salida)
     progreso_max: float = 0.0   # salida: la mayor fracción alcanzada
     muertes: int = 0            # reintentos usados (sin contar la muerte que lo descalifica)
-    saves: int = 0              # save points distintos activados
+    saves: int = 0              # save points distintos activados (incluidos los heredados)
+    inicio: Inicio | None = None
+    nuevos: tuple = ()          # saves activados en esta partida: ((índice, frame, gen, archivos), ...)
 
     def clave(self) -> tuple:
         return (self.fitness, -self.frame_progreso)
@@ -170,8 +188,8 @@ MAX_SLOTS = 6  # savestates por familia (~11 MB cada uno)
 
 def evaluar_en_worker(args) -> list[Resultado]:
     """Evalúa una familia: los hijos de un mismo padre parten del savestate del padre donde se separan."""
-    padre, hijos = args
-    return evaluar_familia(_env, _cfg, padre, hijos)
+    padre, inicio_padre, hijos = args
+    return evaluar_familia(_env, _cfg, padre, inicio_padre, hijos)
 
 
 # Zonas sin salida conocidas, por sala de entrenamiento
@@ -215,6 +233,7 @@ class Estado:
     muertes: int = 0             # reintentos usados
     saves: tuple = ()            # save points activados (índices de `save_points(cfg)`), en orden
     ultimo_save: bytes = b""     # sala y posición del archivo de partida (cambia al guardar)
+    nuevos: tuple = ()           # los activados en esta partida: (índice, frame, gen, archivos)
 
 
 def leer_save(emu) -> bytes:
@@ -294,6 +313,23 @@ def reaparecer(emu, cfg: Config, base: np.ndarray, gen: int, restantes: int) -> 
     return np.concatenate(trozos)
 
 
+def preparar(emu, cfg: Config, inicio: Inicio | None) -> Estado:
+    """Deja el juego listo para jugar un genoma: al comienzo de la sala o, con un save heredado, con el archivo
+    de partida de ese save y tras apretar R (el juego lo deja en el save, como a un jugador que guardó)."""
+    emu.load(0)
+    if inicio is None:
+        return Estado(ultimo_save=leer_save(emu))
+    emu.restaurar_archivos(dict(inicio.archivos))
+    emu.step(("r",), frames=1, obs=False, no_draw=True)
+    for _ in range(100):  # pasa por rInit y vuelve a la sala del save
+        t = emu.step((), frames=1, obs=False, trace=True, no_draw=True).trace
+        if len(t) and t[0]["room"] == cfg.room_entrenamiento and t[0]["alive"]:
+            break
+    else:
+        raise RuntimeError(f"no reapareció en el save {inicio.save}")
+    return Estado(saves=inicio.saves, ultimo_save=leer_save(emu))
+
+
 def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0, guardar: dict | None = None,
           hasta: int | None = None, estado: Estado | None = None):
     """Ejecuta los genes desde el índice `desde` (estando el juego en el frame `frame0`).
@@ -350,6 +386,7 @@ def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0
             k = save_activado(emu, cfg, guardado)
             if k >= 0 and k not in estado.saves:
                 estado.saves += (k,)
+                estado.nuevos += ((k, total, i - 1, tuple(sorted(emu.archivos().items()))),)
         if cae:
             if r.ended or estado.muertes >= cfg.resets:
                 murio = True
@@ -362,11 +399,12 @@ def jugar(emu, cfg: Config, genoma: Genoma, rng, desde: int = 0, frame0: int = 0
     return genoma, trozos, murio, puntos, estado
 
 
-def evaluar(env: IWannaBeTheGBEnv, cfg: Config, genoma: Genoma, semilla: int, padres=(), origen="azar") -> Resultado:
-    """Evalúa un genoma desde el inicio de la sala."""
-    env.emu.load(0)
-    genoma, trozos, murio, _, estado = jugar(env.emu, cfg, genoma, np.random.default_rng(semilla))
-    return puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado)
+def evaluar(env: IWannaBeTheGBEnv, cfg: Config, genoma: Genoma, semilla: int, padres=(), origen="azar",
+            inicio: Inicio | None = None) -> Resultado:
+    """Evalúa un genoma desde el inicio de la sala (o desde su save heredado)."""
+    estado = preparar(env.emu, cfg, inicio)
+    genoma, trozos, murio, _, estado = jugar(env.emu, cfg, genoma, np.random.default_rng(semilla), estado=estado)
+    return puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado, inicio)
 
 
 def primer_gen_distinto(a: Genoma, b: Genoma) -> int:
@@ -375,21 +413,23 @@ def primer_gen_distinto(a: Genoma, b: Genoma) -> int:
     return int(distinto[0]) if len(distinto) else n
 
 
-def evaluar_familia(env: IWannaBeTheGBEnv, cfg: Config, padre: Genoma | None, hijos: list) -> list[Resultado]:
-    """`hijos` = [(genoma, semilla, padres, origen)]. Sin padre, todos se juegan desde el inicio."""
+def evaluar_familia(env: IWannaBeTheGBEnv, cfg: Config, padre: Genoma | None, inicio_padre: Inicio | None,
+                    hijos: list) -> list[Resultado]:
+    """`hijos` = [(genoma, semilla, padres, origen, inicio)]. Sin padre, todos se juegan desde el inicio. Solo
+    los hijos que parten del mismo lugar que el padre aprovechan sus savestates."""
     emu = env.emu
-    ks = [primer_gen_distinto(padre, h[0]) if padre is not None else 0 for h in hijos]
+    ks = [primer_gen_distinto(padre, h[0]) if padre is not None and h[4] == inicio_padre else 0 for h in hijos]
     candidatos = sorted({k for k in ks if k > 0})
     if len(candidatos) > MAX_SLOTS:
         candidatos = sorted({candidatos[int(round(q))] for q in np.linspace(0, len(candidatos) - 1, MAX_SLOTS)})
     puntos, prefijo = {}, []
     if candidatos:
-        emu.load(0)
+        estado = preparar(emu, cfg, inicio_padre)
         guardar = {k: slot + 1 for slot, k in enumerate(candidatos)}
         _, prefijo, _, puntos, _ = jugar(emu, cfg, padre, np.random.default_rng(0), guardar=guardar,
-                                         hasta=candidatos[-1] + 1)
+                                         hasta=candidatos[-1] + 1, estado=estado)
     resultados = []
-    for (genoma, semilla, padres, origen), k in zip(hijos, ks):
+    for (genoma, semilla, padres, origen, inicio), k in zip(hijos, ks):
         usables = [j for j in puntos if j <= k]
         rng = np.random.default_rng(semilla)
         if usables:
@@ -399,9 +439,9 @@ def evaluar_familia(env: IWannaBeTheGBEnv, cfg: Config, padre: Genoma | None, hi
             genoma, trozos, murio, _, estado = jugar(emu, cfg, genoma, rng, desde=j, frame0=frame0, estado=estado0)
             trozos = prefijo[:n_trozos] + trozos
         else:
-            emu.load(0)
-            genoma, trozos, murio, _, estado = jugar(emu, cfg, genoma, rng)
-        resultados.append(puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado))
+            estado = preparar(emu, cfg, inicio)
+            genoma, trozos, murio, _, estado = jugar(emu, cfg, genoma, rng, estado=estado)
+        resultados.append(puntuar(cfg, genoma, unir(trozos), murio, padres, origen, estado, inicio))
     return resultados
 
 
@@ -446,10 +486,10 @@ def completar_traza(traza: np.ndarray, genoma: Genoma) -> np.ndarray:
 
 
 def puntuar(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar",
-            estado: Estado | None = None) -> Resultado:
+            estado: Estado | None = None, inicio: Inicio | None = None) -> Resultado:
     estado = estado or Estado()
     if cfg.recompensa == "salida":
-        return puntuar_salida(cfg, genoma, traza, murio, padres, origen, estado)
+        return puntuar_salida(cfg, genoma, traza, murio, padres, origen, estado, inicio)
     en_sala = np.nonzero((traza["alive"] == 1) & (traza["room"] == cfg.room_entrenamiento))[0]
     # Fuera de los bordes (p. ej. dentro del hueco del techo) cuenta como el borde: no es una pantalla nueva
     x = np.clip(np.floor(traza["x"][en_sala]).astype(np.int64), 0, cfg.room_ancho - 1)
@@ -476,7 +516,8 @@ def puntuar(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=
     if llego:
         fitness += cfg.r_objetivo + cfg.r_tiempo * (cfg.max_frames - len(traza)) / FPS
     return Resultado(genoma, float(fitness), murio, len(traza), int(llego), n_pantallas, n_celdas, frame_progreso,
-                     traza, tuple(padres), origen, muertes=estado.muertes, saves=len(estado.saves))
+                     traza, tuple(padres), origen, muertes=estado.muertes, saves=len(estado.saves), inicio=inicio,
+                     nuevos=estado.nuevos)
 
 
 _mapas: dict[str, dict] = {}
@@ -501,10 +542,11 @@ def distancias(cfg: Config, x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, padres=(), origen="azar",
-                   estado: Estado | None = None) -> Resultado:
+                   estado: Estado | None = None, inicio: Inicio | None = None) -> Resultado:
     """Fitness por cercanía a la salida: r_cercania × progreso final + r_avance × mejor progreso
     + r_pantalla por pantalla del camino alcanzada + r_save por save point nuevo − castigos por reintento y por
-    quedar descalificado (+ premio si llega)."""
+    quedar descalificado (+ premio si llega). Las pantallas y los saves de los ancestros (save heredado) cuentan
+    como alcanzados."""
     estado = estado or Estado()
     mapa = mapa_distancia(cfg)
     d0 = float(mapa["d0"])
@@ -515,6 +557,7 @@ def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, 
     n_celdas = len(np.unique(celdas))
     pantallas = set(zip((x // SCREEN_W).astype(int).tolist(), (y // SCREEN_H).astype(int).tolist()))
     ruta = {tuple(p) for p in mapa["pantallas_ruta"].tolist()}
+    camino = (pantallas & ruta) | (set(inicio.pantallas) if inicio else set())
     llego = len(traza) > 0 and int(traza["room"][-1]) == cfg.room_objetivo
     if len(en_sala):
         d = distancias(cfg, x, y)
@@ -534,7 +577,7 @@ def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, 
     fitness = (
         cfg.r_cercania * progreso
         + cfg.r_avance * progreso_max
-        + cfg.r_pantalla * max(0, len(pantallas & ruta) - 1)
+        + cfg.r_pantalla * max(0, len(camino) - 1)
         + cfg.r_celda * n_celdas
         + cfg.r_save * len(estado.saves)
         - cfg.castigo_reset * estado.muertes
@@ -543,7 +586,8 @@ def puntuar_salida(cfg: Config, genoma: Genoma, traza: np.ndarray, murio: bool, 
     if llego:
         fitness += cfg.r_objetivo + cfg.r_tiempo * (cfg.max_frames - len(traza)) / FPS
     return Resultado(genoma, float(fitness), murio, len(traza), int(llego), len(pantallas), n_celdas, frame_progreso,
-                     traza, tuple(padres), origen, progreso, progreso_max, estado.muertes, len(estado.saves))
+                     traza, tuple(padres), origen, progreso, progreso_max, estado.muertes, len(estado.saves),
+                     inicio, estado.nuevos)
 
 
 def posicion_final(r: Resultado, cfg: Config) -> tuple[float, float]:
@@ -671,6 +715,12 @@ def mutar(rng: np.random.Generator, padre: Resultado, cfg: Config) -> Genoma:
     t0 = max(0, fin - ventana)
     en_ventana = np.unique(padre.traza["gen"][t0:max(fin, 1)]) if len(padre.traza) else []
     candidatos = [int(i) for i in en_ventana if i < len(acciones)]
+    return mutar_ventana(rng, acciones, frames, candidatos, cfg)
+
+
+def mutar_ventana(rng: np.random.Generator, acciones: list, frames: list, candidatos: list, cfg: Config) -> Genoma:
+    """Entre `mut_ventana_min` y `mut_ventana_max` cambios en los genes `candidatos`: otra acción, otra
+    duración, insertar o borrar un gen."""
     if not candidatos:
         candidatos = [max(0, len(acciones) - 1)]
     n = int(rng.integers(cfg.mut_ventana_min, cfg.mut_ventana_max + 1))
@@ -692,3 +742,41 @@ def mutar(rng: np.random.Generator, padre: Resultado, cfg: Config) -> Genoma:
             del acciones[i], frames[i]
             candidatos = [c - (c > i) for c in candidatos if c != i] or [max(0, i - 1)]
     return Genoma(np.array(acciones, np.uint8), np.array(frames, np.uint8))
+
+
+# -- save heredado ----------------------------------------------------------------------------------------
+
+def heredar(r: Resultado, cfg: Config, gen: int, agente: int) -> tuple[Inicio, int] | None:
+    """El save más avanzado (más cerca de la salida) de los que activó `r` en su partida, como Inicio para sus
+    hijos, y el gen que se jugaba al activarlo. None si no activó ninguno nuevo."""
+    if not r.nuevos:
+        return None
+    puntos = save_points(cfg)
+    if cfg.recompensa == "salida" and cfg.mapa_distancia:
+        xy = np.array([puntos[n[0]] for n in r.nuevos], np.float64)
+        j = int(np.argmin(distancias(cfg, xy[:, 0], xy[:, 1])))
+    else:
+        j = len(r.nuevos) - 1                     # sin mapa de distancias: el último que activó
+    k, frame, g, archivos = r.nuevos[j]
+    previos = r.inicio.saves if r.inicio else ()
+    saves = previos + tuple(n[0] for n in r.nuevos[: j + 1])
+    pantallas = set(r.inicio.pantallas) if r.inicio else set()
+    if cfg.recompensa == "salida" and cfg.mapa_distancia:
+        t = r.traza[:frame]
+        t = t[(t["alive"] == 1) & (t["room"] == cfg.room_entrenamiento)]
+        x = np.clip(t["x"].astype(np.float64), 0, cfg.room_ancho - 1)
+        y = np.clip(t["y"].astype(np.float64), 0, cfg.room_alto - 1)
+        ruta = {tuple(p) for p in mapa_distancia(cfg)["pantallas_ruta"].tolist()}
+        pantallas |= set(zip((x // SCREEN_W).astype(int).tolist(), (y // SCREEN_H).astype(int).tolist())) & ruta
+    return Inicio(k, archivos, saves, tuple(sorted(pantallas)), gen, agente, frame), g
+
+
+def mutar_desde_save(rng: np.random.Generator, padre: Resultado, g: int, cfg: Config) -> Genoma:
+    """Genoma para partir del save: lo que el padre hizo después de activarlo (desde el save, no desde donde
+    estaba al dispararle) con cambios en los primeros segundos. Si no le quedaban genes, al azar."""
+    if g + 1 >= len(padre.genoma):
+        return genes_al_azar(rng, cfg.genes_iniciales, cfg)
+    acciones, frames = list(padre.genoma.acciones[g + 1:]), list(padre.genoma.frames[g + 1:])
+    ventana = int(cfg.ventana_muerte_s * FPS * rng.uniform(0.5, 1.5))
+    n = genes_usados(Genoma(np.array(acciones, np.uint8), np.array(frames, np.uint8)), ventana)
+    return mutar_ventana(rng, acciones, frames, list(range(n)), cfg)

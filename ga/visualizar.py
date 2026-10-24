@@ -28,7 +28,8 @@ from PIL import Image, ImageDraw, ImageFont
 from iwbtgb_rl import ACTIONS, IWannaBeTheGBEnv
 
 from . import almacen, recursos
-from .nucleo import TECLA_R, FPS, ROOT, Config, Resultado, distancias, muertes_en, posicion_final, zonas
+from .nucleo import (TECLA_R, FPS, ROOT, Config, Resultado, distancias, muertes_en, posicion_final, preparar,
+                     save_points, zonas)
 
 W, H = 1920, 1080
 MAPA_W = 1440                      # el mapa ocupa la izquierda; a la derecha va el panel
@@ -527,19 +528,20 @@ def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list[Resultado
 
 # -- video: el mejor de una generación, jugando de verdad -------------------------------------------------
 
-def repetir(cfg: Config, r: Resultado, extra: int = FPS):
+def repetir(cfg: Config, r: Resultado, extra: int = FPS, hasta: int | None = None):
     """Repite la partida en el emulador dibujando cada frame, con las teclas que quedaron en la traza (incluidos
-    los reintentos con R). Entrega (frame RGB, registro, teclas) por frame y al final verifica que la
-    repetición coincida con la traza del entrenamiento.
+    los reintentos con R), desde el comienzo de la sala o desde su save heredado. Entrega (frame RGB, registro,
+    teclas) por frame y al final verifica que la repetición coincida con la traza del entrenamiento.
+    `hasta` corta la partida en ese frame.
     """
     env = IWannaBeTheGBEnv(difficulty=cfg.difficulty, start_room=cfg.start_room, obs_type="state",
                            seed=cfg.seed_juego)
     emu = env.emu
     emu.track("player")
-    emu.load(0)
+    preparar(emu, cfg, r.inicio)
     distintos = 0
     try:
-        for esperado in r.traza:
+        for esperado in r.traza[:hasta]:
             a = int(esperado["accion"])
             teclas = ACTIONS[a] if a < len(ACTIONS) else (("r",) if a == TECLA_R else ())
             res = emu.step(teclas, frames=1, obs=True, trace=True)
@@ -556,16 +558,19 @@ def repetir(cfg: Config, r: Resultado, extra: int = FPS):
             print(f"AVISO: {distintos} frames de la repetición no coinciden con la traza del entrenamiento")
 
 
-def video_mejor(corrida: str, gen: int, salida: Path | None = None) -> Path:
+def video_mejor(corrida: str, gen: int, salida: Path | None = None, completo: bool = True) -> Path:
+    """El mejor agente de la generación jugando de verdad. Si parte de un save heredado y `completo`, antes se
+    ven los tramos de sus ancestros: cada uno juega hasta activar el save desde el que parte el siguiente."""
     carpeta, cfg, gen, pob = cargar(corrida, gen)
     esc = Escena(carpeta, cfg)
     cam = Camara(esc)
     metricas = almacen.leer_metricas(carpeta)
     r = max(pob, key=Resultado.clave)
-    n = len(r.traza)
+    tramos = almacen.cadena(carpeta, r) if completo else [(gen, r, None)]
     salida = salida or carpeta / "videos" / f"gen_{gen:04d}_mejor.mp4"
     video = Video(salida)
     sala = cfg.room_entrenamiento
+    puntos = save_points(cfg)
 
     f_titulo, f_grande, f_med, f_chica = fuente(54, True), fuente(40, True, True), fuente(24), fuente(18)
     f_tecla = fuente(22, True)
@@ -581,8 +586,6 @@ def video_mejor(corrida: str, gen: int, salida: Path | None = None) -> Path:
     dp.text((px0, 240), "Camino a la salida" if salida_on else "Celdas exploradas", fill=TEXTO_2, font=f_med)
     dp.text((px0, 330), texto_resultado(r, cfg), fill=TEXTO_2, font=f_chica)
     dp.text((px0, 352), texto_fin(r, cfg), fill=TEXTO_2, font=f_chica)
-    vivo = r.traza["alive"].astype(np.int8)
-    muertes_hasta = np.concatenate([[0], np.cumsum((vivo[:-1] == 1) & (vivo[1:] == 0))])
     dp.text((px0, 474), "Recorrido", fill=TEXTO_2, font=f_med)
     mm_y = 508
     graf_y = mm_y + mm.base.height + 40
@@ -601,44 +604,62 @@ def video_mejor(corrida: str, gen: int, salida: Path | None = None) -> Path:
         avance = 0.0
     recorrido: list[tuple[float, float]] = []
     ultimo = None
-    for f, (obs, reg, teclas) in enumerate(repetir(cfg, r)):
-        img = Image.new("RGB", (W, H), FONDO)
-        img.paste(Image.fromarray(obs).resize((MAPA_W, H), Image.NEAREST), (0, 0))
-        img.paste(panel, (PANEL_X, 0))
-        d = ImageDraw.Draw(img)
-        if reg is not None and reg["alive"] and reg["room"] == sala:
-            celdas_vistas.add((int(reg["x"]) // cfg.celda, int(reg["y"]) // cfg.celda))
-            ultimo = (float(reg["x"]), float(reg["y"]))
-            recorrido.append(ultimo)
-            cam.actual = cam.pantalla_de(*ultimo)
+    reloj = 0  # frames jugados contando los tramos anteriores
+    for nt, (g_tramo, rt, hasta) in enumerate(tramos):
+        final = nt == len(tramos) - 1
+        n = len(rt.traza) if hasta is None else min(hasta, len(rt.traza))
+        vivo = rt.traza["alive"].astype(np.int8)
+        muertes_hasta = np.concatenate([[0], np.cumsum((vivo[:-1] == 1) & (vivo[1:] == 0))])
+        if len(tramos) > 1:
+            desde = f"desde el save {rt.inicio.save + 1}" if rt.inicio else "desde el comienzo"
+            meta = f"hasta activar el save {tramos[nt + 1][1].inicio.save + 1}" if not final else "su partida"
+            rotulo = (f"Tramo {nt + 1} de {len(tramos)} · agente de la gen. {gen if final else g_tramo} · "
+                      f"{desde}, {meta}")
+        for f, (obs, reg, teclas) in enumerate(repetir(cfg, rt, extra=FPS if final else 0, hasta=hasta)):
+            img = Image.new("RGB", (W, H), FONDO)
+            img.paste(Image.fromarray(obs).resize((MAPA_W, H), Image.NEAREST), (0, 0))
+            img.paste(panel, (PANEL_X, 0))
+            d = ImageDraw.Draw(img)
+            if reg is not None and reg["alive"] and reg["room"] == sala:
+                celdas_vistas.add((int(reg["x"]) // cfg.celda, int(reg["y"]) // cfg.celda))
+                ultimo = (float(reg["x"]), float(reg["y"]))
+                recorrido.append(ultimo)
+                cam.actual = cam.pantalla_de(*ultimo)
+                if salida_on:
+                    avance = 1.0 - float(distancias(cfg, np.array([ultimo[0]]), np.array([ultimo[1]]))[0]) / d0
+            d.text((x, 172), tiempo(reloj + min(f + 1, n)), fill=TEXTO, font=f_grande)
             if salida_on:
-                avance = 1.0 - float(distancias(cfg, np.array([ultimo[0]]), np.array([ultimo[1]]))[0]) / d0
-        d.text((x, 172), tiempo(min(f + 1, n)), fill=TEXTO, font=f_grande)
-        if salida_on:
-            if f >= n and r.llego:
-                avance = 1.0
-            d.text((x, 266), f"{100 * avance:.1f} %", fill=TEXTO, font=f_grande)
-        else:
-            d.text((x, 266), f"{len(celdas_vistas)}", fill=TEXTO, font=f_grande)
-        for nombre, etiqueta, bx, bw in teclas_def:
-            on = nombre in teclas
-            d.rounded_rectangle((x + bx, 384, x + bx + bw, 430), radius=8, fill=AZUL if on else (45, 45, 43),
-                                outline=AZUL if on else TEXTO_3)
-            d.text((x + bx + bw / 2, 407), etiqueta, fill=TEXTO if on else TEXTO_3, font=f_tecla, anchor="mm")
-        if cfg.resets:
-            k = int(muertes_hasta[min(f, n - 1)])
-            d.text((x, 444), f"Intento {min(k + 1, cfg.resets + 1)} de {cfg.resets + 1}"
-                   + ("   · R" if "r" in teclas else ""), fill=TEXTO_2 if k == 0 else NARANJA, font=f_med)
-        mm.dibujar(img, x, mm_y, [], ultimo)
-        if len(recorrido) > 1:
-            d.line([(x + px * mm.k, mm_y + py * mm.k) for px, py in recorrido[::2] + recorrido[-1:]],
-                   fill=DORADO, width=2)
-        if f >= n:
-            estado = "¡LLEGÓ!" if r.llego else (("DESCALIFICADO" if cfg.resets else "MURIÓ") if r.murio
-                                                else "SE ACABÓ EL TIEMPO")
-            d.text((MAPA_W // 2, 80), estado, fill=AQUA if r.llego else ROJO, font=fuente(72, True),
-                   anchor="mm", stroke_width=4, stroke_fill=(0, 0, 0))
-        video.escribir(img)
+                if final and f >= n and rt.llego:
+                    avance = 1.0
+                d.text((x, 266), f"{100 * avance:.1f} %", fill=TEXTO, font=f_grande)
+            else:
+                d.text((x, 266), f"{len(celdas_vistas)}", fill=TEXTO, font=f_grande)
+            for nombre, etiqueta, bx, bw in teclas_def:
+                on = nombre in teclas
+                d.rounded_rectangle((x + bx, 384, x + bx + bw, 430), radius=8, fill=AZUL if on else (45, 45, 43),
+                                    outline=AZUL if on else TEXTO_3)
+                d.text((x + bx + bw / 2, 407), etiqueta, fill=TEXTO if on else TEXTO_3, font=f_tecla, anchor="mm")
+            if cfg.resets:
+                k = int(muertes_hasta[min(f, n - 1)]) if n else 0
+                d.text((x, 444), f"Intento {min(k + 1, cfg.resets + 1)} de {cfg.resets + 1}"
+                       + ("   · R" if "r" in teclas else ""), fill=TEXTO_2 if k == 0 else NARANJA, font=f_med)
+            mm.dibujar(img, x, mm_y, [], ultimo)
+            if len(recorrido) > 1:
+                d.line([(x + px * mm.k, mm_y + py * mm.k) for px, py in recorrido[::2] + recorrido[-1:]],
+                       fill=DORADO, width=2)
+            for t in tramos[1:]:  # saves desde los que parte algún tramo
+                sx, sy = puntos[t[1].inicio.save]
+                cx, cy = x + sx * mm.k, mm_y + sy * mm.k
+                d.rectangle((cx - 4, cy - 4, cx + 4, cy + 4), outline=AQUA, width=2)
+            if len(tramos) > 1:
+                d.text((20, 16), rotulo, fill=TEXTO, font=f_med, stroke_width=3, stroke_fill=(0, 0, 0))
+            if final and f >= n:
+                estado = "¡LLEGÓ!" if rt.llego else (("DESCALIFICADO" if cfg.resets else "MURIÓ") if rt.murio
+                                                     else "SE ACABÓ EL TIEMPO")
+                d.text((MAPA_W // 2, 80), estado, fill=AQUA if rt.llego else ROJO, font=fuente(72, True),
+                       anchor="mm", stroke_width=4, stroke_fill=(0, 0, 0))
+            video.escribir(img)
+        reloj += n
     video.cerrar()
     return salida
 

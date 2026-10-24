@@ -14,7 +14,8 @@ OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llev
   un algoritmo genético en `ga/`; corridas en `corridas/`: `rStage01` (exp. 1, exploración, estancado en la mitad
   superior), `salida01` (exp. 2, distancia a la salida por el laberinto, nichos, 1 min) y las que lanza el usuario
   desde la app. La sala de portales de `rStage01` es zona prohibida (`zonas_prohibidas`, cuenta como muerte).
-  Desde el 2026-10-23 los agentes tienen 3 reintentos (R → último save) y premio por save point nuevo. `corridas/` es un
+  Desde el 2026-10-23 los agentes tienen 3 reintentos (R → último save) y premio por save point nuevo. Los hijos pueden partir
+  del save que activó su padre (`prob_desde_save`, "save heredado"). `corridas/` es un
   enlace a `/mnt/datos/iwbtgb/corridas` (disco duro de datos): ahí van las corridas largas.
 - Detalles del formato GM7 en `docs/formato-gm7.md`; guía y protocolo RL en `docs/entorno-rl.md`. Leerlos
   antes de tocar el lector GM7 o el modo RL.

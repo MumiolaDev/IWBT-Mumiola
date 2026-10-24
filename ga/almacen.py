@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .nucleo import TRAZA_DTYPE, Config, Genoma, Resultado, compactar, completar_traza
+from .nucleo import TRAZA_DTYPE, Config, Genoma, Inicio, Resultado, compactar, completar_traza
 
 ROOT = Path(__file__).resolve().parent.parent
 CORRIDAS = ROOT / "corridas"
@@ -18,8 +18,40 @@ CAMPOS_METRICAS = [
     "pantallas_max", "pantallas_media", "llegaron", "celdas_max", "celdas_media",
     "muertes_pct", "segundos_medio", "segundos_mejor", "evaluados", "segundos_reloj",
     "progreso_max", "progreso_final_max", "progreso_media", "nichos",
-    "saves_max", "saves_media", "reintentos_media",
+    "saves_max", "saves_media", "reintentos_media", "desde_save_pct",
 ]
+
+
+# Save heredado y saves activados: JSON por agente (los archivos de partida en hexadecimal)
+def _archivos_json(archivos: tuple) -> list:
+    return [[nombre, datos.hex()] for nombre, datos in archivos]
+
+
+def _archivos_de_json(lista: list) -> tuple:
+    return tuple((nombre, bytes.fromhex(h)) for nombre, h in lista)
+
+
+def inicio_a_json(inicio: Inicio | None) -> str:
+    if inicio is None:
+        return ""
+    return json.dumps([inicio.save, _archivos_json(inicio.archivos), list(inicio.saves),
+                       [list(p) for p in inicio.pantallas], inicio.gen, inicio.agente, inicio.frame])
+
+
+def inicio_de_json(texto: str) -> Inicio | None:
+    if not texto:
+        return None
+    save, archivos, saves, pantallas, gen, agente, frame = json.loads(texto)
+    return Inicio(save, _archivos_de_json(archivos), tuple(saves), tuple(tuple(p) for p in pantallas), gen, agente,
+                  frame)
+
+
+def nuevos_a_json(nuevos: tuple) -> str:
+    return json.dumps([[k, frame, g, _archivos_json(a)] for k, frame, g, a in nuevos]) if nuevos else ""
+
+
+def nuevos_de_json(texto: str) -> tuple:
+    return tuple((k, frame, g, _archivos_de_json(a)) for k, frame, g, a in json.loads(texto)) if texto else ()
 
 
 def dir_corrida(nombre: str) -> Path:
@@ -47,6 +79,8 @@ def guardar_generacion(carpeta: Path, gen: int, pob: list[Resultado]) -> Path:
             progreso_max=np.array([r.progreso_max for r in pob]),
             muertes=np.array([r.muertes for r in pob]),
             saves=np.array([r.saves for r in pob]),
+            inicio=np.array([inicio_a_json(r.inicio) for r in pob]),
+            nuevos=np.array([nuevos_a_json(r.nuevos) for r in pob]),
             origen=np.array([r.origen for r in pob]),
             padres=np.array([",".join(map(str, r.padres)) for r in pob]),
             genoma_largo=largos,
@@ -82,8 +116,23 @@ def cargar_generacion(carpeta: Path, gen: int) -> list[Resultado]:
             float(d["progreso_max"][i]) if "progreso_max" in d else 0.0,
             int(d["muertes"][i]) if "muertes" in d else 0,
             int(d["saves"][i]) if "saves" in d else 0,
+            inicio_de_json(str(d["inicio"][i])) if "inicio" in d else None,
+            nuevos_de_json(str(d["nuevos"][i])) if "nuevos" in d else (),
         ))
     return pob
+
+
+
+def cadena(carpeta: Path, r: Resultado) -> list[tuple[int | None, Resultado, int | None]]:
+    """Tramos del recorrido completo de `r`: [(generación, agente, frame donde termina su tramo)], desde el
+    ancestro que partió del comienzo hasta `r` (último tramo, sin corte). Cada tramo termina al activar el save
+    desde el que parte el siguiente."""
+    tramos = [(None, r, None)]
+    while r.inicio is not None:
+        ini = r.inicio
+        r = cargar_generacion(carpeta, ini.gen)[ini.agente]
+        tramos.insert(0, (ini.gen, r, ini.frame))
+    return tramos
 
 
 def generaciones_guardadas(carpeta: Path) -> list[int]:
@@ -100,6 +149,7 @@ def cargar_config(carpeta: Path) -> Config:
     d.setdefault("zonas_prohibidas", "")
     d.setdefault("resets", 0)
     d.setdefault("save_points", "")
+    d.setdefault("prob_desde_save", 0.0)
     return Config(**d)
 
 

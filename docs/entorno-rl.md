@@ -198,6 +198,26 @@ cuenta dentro de `max_segundos`.
   cortan por gen usando `gen`.
 - Corridas anteriores: `resets` = 0 y sin save points. Cambiar `--resets` al continuar mezcla puntajes.
 
+**Save heredado** (`prob_desde_save`, 0,3; corridas anteriores: 0). Cada hijo de un padre que activó un save
+point nuevo parte, con esa probabilidad, desde ese save (el más cercano a la salida de los que activó), con
+`max_segundos` y los reintentos completos. Es la ventaja real del save: no repetir el camino hasta él.
+
+- Partir del save (`nucleo.preparar`): savestate inicial, se escriben los archivos de `save/` que tenía el padre
+  justo después de guardar y se aprieta R. El juego lo deja en el save, igual que a un jugador.
+- `Inicio` (en `Resultado.inicio`, JSON en el `.npz`) guarda: el save, esos archivos, los saves y las pantallas
+  del camino ya logrados por los ancestros (cuentan en el fitness), y la generación, el agente y el frame que lo
+  activaron. `Resultado.nuevos` = saves activados en la propia partida, con su gen, frame y archivos.
+- Genoma del hijo: lo que el padre hizo después de activar el save, con cambios en los primeros ~2 s. Los hijos
+  de un agente que parte de un save parten del mismo save. El cruce solo se hace entre padres que parten del
+  mismo lugar. La evaluación por familias sigue siendo idéntica a jugar desde cero (verificado 8 de 8).
+- Al continuar una corrida de antes, los agentes cuyos saves no se conocen (los que tienen más saves que los
+  registrados en `nuevos`, como la élite) se vuelven a jugar con las reglas actuales y la generación se guarda de
+  nuevo.
+- `video_mejor` muestra el recorrido completo: tramo por tramo, cada ancestro juega hasta activar el save
+  desde el que parte el siguiente (`almacen.cadena`).
+- Métrica nueva: `desde_save_pct`. En una prueba sobre `150AStage01_00` pasó de 0 a 70 % en 3 generaciones y
+  los nichos bajaron de 25 a 13: muchos agentes mueren en el mismo lugar después del mismo save.
+
 **Borrar corridas.** Botón "Borrar corrida…" en la app (pide confirmación y no deja borrar una corrida que esté
 usando un proceso), o `rm -r corridas/<nombre>` (borra en el disco de datos, por el enlace).
 

@@ -21,8 +21,9 @@ from dataclasses import fields, replace
 import numpy as np
 
 from . import almacen
-from .nucleo import (Config, Resultado, cruzar, evaluar_en_worker, genes_al_azar, genes_usados, iniciar_worker, mutar,
-                     nicho, resolver_rooms, resolver_saves, resolver_zonas, torneo)
+from .nucleo import (Config, Inicio, Resultado, cruzar, evaluar_en_worker, genes_al_azar, genes_usados, heredar,
+                     iniciar_worker, mutar, mutar_desde_save, nicho, resolver_rooms, resolver_saves, resolver_zonas,
+                     torneo)
 
 
 def resumen(gen: int, pob: list[Resultado], evaluados: int, reloj: float, cfg: Config) -> dict:
@@ -36,6 +37,7 @@ def resumen(gen: int, pob: list[Resultado], evaluados: int, reloj: float, cfg: C
         "saves_max": max(r.saves for r in pob),
         "saves_media": round(float(np.mean([r.saves for r in pob])), 2),
         "reintentos_media": round(float(np.mean([r.muertes for r in pob])), 2),
+        "desde_save_pct": round(100.0 * np.mean([r.inicio is not None for r in pob]), 1),
         "gen": gen,
         "fitness_max": round(float(fit.max()), 2),
         "fitness_media": round(float(fit.mean()), 2),
@@ -70,41 +72,61 @@ def elegir_padres(pob: list[Resultado], cfg: Config) -> list[int]:
     return elegidos + resto[: cfg.padres - len(elegidos)]
 
 
-def huella(g, frames: int) -> bytes:
-    """Identifica la parte del genoma que alcanza a jugarse (dos huellas iguales = la misma partida)."""
+def huella(g, frames: int, inicio: Inicio | None = None) -> bytes:
+    """Identifica la parte del genoma que alcanza a jugarse y desde dónde parte (dos huellas iguales = la misma
+    partida)."""
     n = genes_usados(g, frames)
-    return g.acciones[:n].tobytes() + g.frames[:n].tobytes()
+    lugar = repr((inicio.gen, inicio.agente, inicio.save)).encode() if inicio else b""
+    return lugar + g.acciones[:n].tobytes() + g.frames[:n].tobytes()
 
 
-def siguiente_generacion(rng: np.random.Generator, pob: list[Resultado], cfg: Config):
-    """Devuelve (élite que pasa sin reevaluar, tareas de evaluación para el resto)."""
+class Engendrar:
+    """Crea un hijo de `pob[ia]`: desde su save más avanzado (si activó uno nuevo, con prob. `prob_desde_save`),
+    por cruce con otro padre que parta del mismo lugar, o por mutación. `gen` = generación de `pob`."""
+
+    def __init__(self, pob: list[Resultado], cfg: Config, gen: int):
+        self.pob, self.cfg, self.gen = pob, cfg, gen
+        self.herencias: dict[int, tuple | None] = {}
+
+    def __call__(self, rng: np.random.Generator, ia: int, pareja) -> tuple:
+        pob, cfg, a = self.pob, self.cfg, self.pob[ia]
+        if cfg.prob_desde_save > 0:
+            if ia not in self.herencias:
+                self.herencias[ia] = heredar(a, cfg, self.gen, ia)
+            her = self.herencias[ia]
+            if her and rng.random() < cfg.prob_desde_save:
+                inicio, g = her
+                return mutar_desde_save(rng, a, g, cfg), (ia,), "save", inicio
+        if rng.random() < cfg.prob_cruce:
+            ib = pareja()
+            if ib is not None and ib != ia and pob[ib].inicio == a.inicio:
+                b = pob[ib]
+                hijo = cruzar(rng, a, b)
+                base = Resultado(hijo, a.fitness, a.murio, a.frames, a.llego, a.pantallas, a.celdas,
+                                 a.frame_progreso, a.traza)
+                return mutar(rng, base, cfg), (ia, ib), "cruce", a.inicio
+        return mutar(rng, a, cfg), (ia,), "mutacion", a.inicio
+
+
+def siguiente_generacion(rng: np.random.Generator, pob: list[Resultado], cfg: Config, gen: int):
+    """Devuelve (élite que pasa sin reevaluar, tareas de evaluación para el resto). `gen` = generación de `pob`."""
     if cfg.seleccion == "nichos":
-        return siguiente_generacion_nichos(rng, pob, cfg)
+        return siguiente_generacion_nichos(rng, pob, cfg, gen)
     orden = sorted(range(len(pob)), key=lambda i: pob[i].clave(), reverse=True)
     elite = []
     for i in orden[: cfg.elite]:
         r = pob[i]
         elite.append(replace(r, padres=(i,), origen="elite"))
+    engendrar = Engendrar(pob, cfg, gen)
     tareas = []
     while len(elite) + len(tareas) < cfg.poblacion:
         ia = torneo(rng, pob, cfg.torneo)
-        a = pob[ia]
-        if rng.random() < cfg.prob_cruce:
-            ib = torneo(rng, pob, cfg.torneo)
-            b = pob[ib]
-            hijo = cruzar(rng, a, b)
-            base = Resultado(hijo, a.fitness, a.murio, a.frames, a.llego, a.pantallas, a.celdas,
-                             a.frame_progreso, a.traza)
-            genoma = mutar(rng, base, cfg)
-            padres, origen = (ia, ib), "cruce"
-        else:
-            genoma = mutar(rng, a, cfg)
-            padres, origen = (ia,), "mutacion"
-        tareas.append((genoma, int(rng.integers(2**31)), padres, origen))
+        genoma, padres, origen, inicio = engendrar(rng, ia, lambda: torneo(rng, pob, cfg.torneo))
+        tareas.append((genoma, int(rng.integers(2**31)), padres, origen, inicio))
     return elite, tareas
 
 
-def siguiente_generacion_nichos(rng: np.random.Generator, pob: list[Resultado], cfg: Config):
+def siguiente_generacion_nichos(rng: np.random.Generator, pob: list[Resultado], cfg: Config, gen: int):
     """Los padres (mejores de nichos distintos) pasan como élite y se reparten los hijos por igual.
     Un hijo que repetiría exactamente una partida ya vista se vuelve a mutar."""
     padres = elegir_padres(pob, cfg)
@@ -112,7 +134,8 @@ def siguiente_generacion_nichos(rng: np.random.Generator, pob: list[Resultado], 
     for i in padres[: cfg.elite]:
         r = pob[i]
         elite.append(replace(r, padres=(i,), origen="elite"))
-    vistas = {huella(pob[i].genoma, pob[i].frames) for i in range(len(pob))}
+    vistas = {huella(r.genoma, r.frames, r.inicio) for r in pob}
+    engendrar = Engendrar(pob, cfg, gen)
     tareas = []
     turno = list(padres)
     rng.shuffle(turno)
@@ -120,24 +143,15 @@ def siguiente_generacion_nichos(rng: np.random.Generator, pob: list[Resultado], 
     while len(elite) + len(tareas) < cfg.poblacion:
         ia = turno[k % len(turno)]
         k += 1
-        a = pob[ia]
+        pareja = [j for j in padres if j != ia and pob[j].inicio == pob[ia].inicio]
         for _ in range(10):
-            if len(padres) > 1 and rng.random() < cfg.prob_cruce:
-                ib = int(rng.choice([j for j in padres if j != ia]))
-                b = pob[ib]
-                hijo = cruzar(rng, a, b)
-                base = Resultado(hijo, a.fitness, a.murio, a.frames, a.llego, a.pantallas, a.celdas,
-                                 a.frame_progreso, a.traza)
-                genoma = mutar(rng, base, cfg)
-                padres_hijo, origen = (ia, ib), "cruce"
-            else:
-                genoma = mutar(rng, a, cfg)
-                padres_hijo, origen = (ia,), "mutacion"
-            h = huella(genoma, cfg.max_frames)
+            genoma, padres_hijo, origen, inicio = engendrar(
+                rng, ia, lambda: int(rng.choice(pareja)) if pareja else None)
+            h = huella(genoma, cfg.max_frames, inicio)
             if h not in vistas:
                 break
         vistas.add(h)
-        tareas.append((genoma, int(rng.integers(2**31)), padres_hijo, origen))
+        tareas.append((genoma, int(rng.integers(2**31)), padres_hijo, origen, inicio))
     return elite, tareas
 
 
@@ -152,10 +166,10 @@ def evaluar_todas(pool, tareas, pob: list[Resultado] | None) -> list[Resultado]:
         familias.setdefault(t[2][0] if pob is not None and t[2] else -1 - i, []).append(i)
     trabajos = []
     for padre, idx in familias.items():
-        genoma_padre = pob[padre].genoma if padre >= 0 else None
+        genoma_padre, inicio_padre = (pob[padre].genoma, pob[padre].inicio) if padre >= 0 else (None, None)
         for c in range(0, len(idx), HIJOS_POR_TAREA):
             parte = idx[c:c + HIJOS_POR_TAREA]
-            trabajos.append((parte, (genoma_padre, [tareas[i] for i in parte])))
+            trabajos.append((parte, (genoma_padre, inicio_padre, [tareas[i] for i in parte])))
     # Las familias más grandes primero, para repartir mejor la carga
     trabajos.sort(key=lambda t: -len(t[0]))
     resultados: list[Resultado | None] = [None] * len(tareas)
@@ -204,18 +218,31 @@ def main():
     print(f"corrida {carpeta}  población {cfg.poblacion}  workers {cfg.workers}  "
           f"tope {cfg.max_segundos:.0f} s de juego  room {cfg.room_entrenamiento} -> {cfg.sala_objetivo} "
           f"({cfg.room_objetivo})  zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}  reintentos: {cfg.resets}  "
-          f"save points: {len(cfg.save_points.split(';')) if cfg.save_points else 0}", flush=True)
+          f"save points: {len(cfg.save_points.split(';')) if cfg.save_points else 0}  "
+          f"parten del save heredado: {100 * cfg.prob_desde_save:.0f} %", flush=True)
 
     inicio_total = time.time()
     with mp.get_context("spawn").Pool(cfg.workers, initializer=iniciar_worker, initargs=(cfg,)) as pool:
         if hechas:
             gen = hechas[-1]
             pob = almacen.cargar_generacion(carpeta, gen)
+            # Agentes de antes del save heredado (o élite que viene de entonces): no se sabe qué saves activaron.
+            # Se vuelven a jugar, con las reglas actuales, así su fitness también queda al día
+            viejos = [i for i, r in enumerate(pob)
+                      if r.saves > len(r.nuevos) + (len(r.inicio.saves) if r.inicio else 0)]
+            if cfg.prob_desde_save > 0 and viejos:
+                print(f"re-evaluando {len(viejos)} agentes de la generación {gen} para saber qué saves activaron",
+                      flush=True)
+                tareas = [(pob[i].genoma, i, pob[i].padres, pob[i].origen, pob[i].inicio) for i in viejos]
+                for i, r in zip(viejos, evaluar_todas(pool, tareas, None)):
+                    pob[i] = r
+                # Los hijos que partan de sus saves apuntan a esta generación (video del recorrido completo)
+                almacen.guardar_generacion(carpeta, gen, pob)
             gen += 1
         else:
             gen = 0
             t = time.time()
-            tareas = [(genes_al_azar(rng, cfg.genes_iniciales, cfg), int(rng.integers(2**31)), (), "azar")
+            tareas = [(genes_al_azar(rng, cfg.genes_iniciales, cfg), int(rng.integers(2**31)), (), "azar", None)
                       for _ in range(cfg.poblacion)]
             pob = evaluar_todas(pool, tareas, None)
             almacen.guardar_generacion(carpeta, 0, pob)
@@ -226,7 +253,7 @@ def main():
 
         while gen < cfg.generaciones:
             t = time.time()
-            elite, tareas = siguiente_generacion(rng, pob, cfg)
+            elite, tareas = siguiente_generacion(rng, pob, cfg, gen - 1)
             pob = elite + evaluar_todas(pool, tareas, pob)
             almacen.guardar_generacion(carpeta, gen, pob)
             fila = resumen(gen, pob, len(tareas), time.time() - t, cfg)
@@ -240,6 +267,7 @@ def imprimir(f: dict) -> None:
     print(f"gen {f['gen']:4d} | fitness máx {f['fitness_max']:8.1f} media {f['fitness_media']:7.1f} | "
           f"camino máx {f['progreso_max']:5.1f} % | nichos {f['nichos']:3d} | "
           f"saves máx {f['saves_max']} media {f['saves_media']:4.2f} | reintentos {f['reintentos_media']:4.2f} | "
+          f"desde save {f['desde_save_pct']:5.1f} % | "
           f"pantallas máx {f['pantallas_max']} llegaron {f['llegaron']} | "
           f"muertes {f['muertes_pct']:5.1f} % | vida media {f['segundos_medio']:6.1f} s | "
           f"{f['segundos_reloj']:6.1f} s", flush=True)

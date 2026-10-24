@@ -185,6 +185,10 @@ class Ventana(QMainWindow):
         self.f_segundos.setValue(d.max_segundos)
         self.f_resets = spin(0, 100, d.resets)
         self.f_resets.setToolTip("Muertes que puede reintentar (R → último save) antes de quedar descalificado")
+        self.f_desde_save = spin(0, 100, round(100 * d.prob_desde_save))
+        self.f_desde_save.setSuffix(" %")
+        self.f_desde_save.setToolTip("Hijos de un padre que activó un save point nuevo que parten desde ese save, "
+                                     "con el tiempo y los reintentos completos")
         self.f_workers = spin(1, os.cpu_count() or 1, d.workers)
         self.f_seed = spin(0, 1_000_000, d.seed)
         self.f_extra = QLineEdit()
@@ -200,6 +204,7 @@ class Ventana(QMainWindow):
         form.addRow("Hasta la generación", self.f_generaciones)
         form.addRow("Duración del intento", self.f_segundos)
         form.addRow("Reintentos (R al último save)", self.f_resets)
+        form.addRow("Hijos que parten del save heredado", self.f_desde_save)
         form.addRow("Procesos en paralelo", self.f_workers)
         form.addRow("Semilla", self.f_seed)
         form.addRow("Otras opciones", self.f_extra)
@@ -237,6 +242,7 @@ class Ventana(QMainWindow):
         self.f_generaciones.setValue(cfg.generaciones)
         self.f_segundos.setValue(cfg.max_segundos)
         self.f_resets.setValue(cfg.resets)
+        self.f_desde_save.setValue(round(100 * cfg.prob_desde_save))
         self.f_seed.setValue(cfg.seed)
         self.f_extra.clear()
 
@@ -252,6 +258,7 @@ class Ventana(QMainWindow):
             "generaciones": self.f_generaciones.value(),
             "max_segundos": float(self.f_segundos.value()),
             "resets": self.f_resets.value(),
+            "prob_desde_save": self.f_desde_save.value() / 100,
             "workers": self.f_workers.value(),
             "seed": self.f_seed.value(),
         }
@@ -284,6 +291,8 @@ class Ventana(QMainWindow):
                     return
                 if not guardada.save_points:  # corrida anterior a los save points: también se activan
                     vals["save_points"] = "auto"
+            if "prob_desde_save" in vals and not guardada.save_points:
+                vals["save_points"] = "auto"
             if vals["generaciones"] <= hechas[-1] + 1:
                 QMessageBox.information(self, "Continuar", f"Ya tiene {hechas[-1] + 1} generaciones: "
                                         "sube «Hasta la generación».")
@@ -435,7 +444,8 @@ class Ventana(QMainWindow):
                  f"recompensa: {cfg.recompensa} · selección: {cfg.seleccion}",
                  f"zonas prohibidas: {cfg.zonas_prohibidas or 'ninguna'}",
                  f"reintentos: {cfg.resets} · save points: "
-                 f"{len(cfg.save_points.split(';')) if cfg.save_points and cfg.save_points != 'auto' else 0}"]
+                 f"{len(cfg.save_points.split(';')) if cfg.save_points and cfg.save_points != 'auto' else 0} · "
+                 f"parten del save heredado: {100 * cfg.prob_desde_save:.0f} %"]
         try:
             filas = almacen.leer_metricas(carpeta)
         except (FileNotFoundError, ValueError):
@@ -449,7 +459,8 @@ class Ventana(QMainWindow):
                 texto.append(f"nichos: {u['nichos']:.0f}")
             if "saves_max" in u:
                 texto.append(f"saves máx: {max(f['saves_max'] for f in filas):.0f} · "
-                             f"reintentos medios: {u['reintentos_media']:.1f}")
+                             f"reintentos medios: {u['reintentos_media']:.1f}"
+                             + (f" · desde un save: {u['desde_save_pct']:.0f} %" if "desde_save_pct" in u else ""))
             texto.append(f"llegaron a la salida: {u['llegaron']:.0f}")
             texto.append(f"muertes: {u['muertes_pct']:.0f} % · vida media {u['segundos_medio']:.1f} s")
         self.resumen.setText("<br>".join(texto))
