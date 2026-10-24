@@ -8,15 +8,29 @@ La app Android de fangames (hub con rankings, *I Wanna be the Guy: Remastered*) 
 propio repo: `~/Programacion/FangameHub`. Allí se trabaja en otra sesión. Cada repo tiene su propia copia de
 OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llevarlo a mano al otro.
 
-## Estado (2026-10-23)
+## Estado (2026-10-24)
 
-- El GB corre nativo (`./scripts/jugar.sh`). 2026-10-23: el usuario retomó el RL para un video de YouTube. Hay
-  un algoritmo genético en `ga/`; corridas en `corridas/`: `rStage01` (exp. 1, exploración, estancado en la mitad
-  superior), `salida01` (exp. 2, distancia a la salida por el laberinto, nichos, 1 min) y las que lanza el usuario
-  desde la app. La sala de portales de `rStage01` es zona prohibida (`zonas_prohibidas`, cuenta como muerte).
-  Desde el 2026-10-23 los agentes tienen 3 reintentos (R → último save) y premio por save point nuevo. Los hijos pueden partir
-  del save que activó su padre (`prob_desde_save`, "save heredado"). `corridas/` es un
-  enlace a `/mnt/datos/iwbtgb/corridas` (disco duro de datos): ahí van las corridas largas.
+- El GB corre nativo (`./scripts/jugar.sh`). El RL con PPO nunca se entrenó; el trabajo actual es un algoritmo
+  genético (`ga/`) para un video de YouTube. El usuario lo maneja desde la app Qt (`ga.app`) y lanza sus propias
+  corridas.
+- Mecánica actual del GA (detalle en `docs/entorno-rl.md`, sección "Algoritmo genético"):
+  - genoma TAS de genes `(acción, frames)`, evaluado por familias con savestates;
+  - fitness por distancia a la salida por el laberinto (Dijkstra) y nichos de 64 px;
+  - zona prohibida: la sala de portales de `rStage01` cuenta como muerte;
+  - reintentos: R → último save, `resets`;
+  - premio por save point nuevo (`r_save`);
+  - save heredado: los hijos parten del save que activó su padre (`prob_desde_save`), y el video del mejor
+    muestra el recorrido completo por tramos.
+- Corridas: `corridas/` es un enlace a `/mnt/datos/iwbtgb/corridas` (disco de datos). Estado y lo aprendido de
+  cada una en `docs/entorno-rl.md` → "Estado de las corridas". Ninguna pasó del ~20,5 % del camino de
+  `rStage01`. No borrar ni modificar corridas del usuario. Para pruebas, crear una aparte (`_prueba_*`) y
+  borrarla al terminar.
+- Compatibilidad: cada regla nueva tiene un valor por defecto "apagado" para corridas viejas
+  (`almacen.cargar_config`, `setdefault`). La app abierta usa el código con el que se abrió. Los entrenamientos
+  que lanza son procesos nuevos, así que usan el código del disco. Tras cambiar `Config`, hay que cerrar y
+  reabrir la app.
+- Informe del experimento (artifact): https://claude.ai/artifact/XBoYLppCkJP2CkYwzmkP8E. Cubre los exp. 1–2;
+  aún no incluye reintentos ni save heredado.
 - Detalles del formato GM7 en `docs/formato-gm7.md`; guía y protocolo RL en `docs/entorno-rl.md`. Leerlos
   antes de tocar el lector GM7 o el modo RL.
 

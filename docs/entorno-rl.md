@@ -147,7 +147,9 @@ usada queda en `corridas/<nombre>/config.json` y `--continuar` la respeta.
 
 Interfaz gráfica (PySide6): `uv run python -m ga.app`. Lanza los mismos comandos como procesos aparte, cada uno
 en su propio grupo de procesos. "Detener" manda Ctrl+C al proceso principal, que deja guardadas las
-generaciones completas, y a los 10 s mata el grupo entero, emuladores y ffplay incluidos. Las generaciones se
+generaciones completas, y a los 10 s mata el grupo entero, emuladores y ffplay incluidos. El formulario cubre
+agentes, padres (= élite), generaciones, duración, reintentos, % de hijos que parten del save heredado,
+procesos y semilla; el resto va en "Otras opciones". Al continuar solo pasa los valores que cambiaron. Las generaciones se
 escriben a un `.tmp` y se renombran, así que un corte nunca deja un `.npz` roto. `corridas/` es un enlace a
 `/mnt/datos/iwbtgb/corridas`.
 
@@ -217,6 +219,9 @@ point nuevo parte, con esa probabilidad, desde ese save (el más cercano a la sa
   desde el que parte el siguiente (`almacen.cadena`).
 - Métrica nueva: `desde_save_pct`. En una prueba sobre `150AStage01_00` pasó de 0 a 70 % en 3 generaciones y
   los nichos bajaron de 25 a 13: muchos agentes mueren en el mismo lugar después del mismo save.
+- **Bajar `prob_desde_save` (incluso a 0) no devuelve a nadie al comienzo**: los hijos de un agente que parte
+  de un save siempre parten de ese save. Solo deja de crear linajes nuevos. Una vez que toda la población parte
+  de un save (pasa en ~5 generaciones), el comienzo de la sala no se vuelve a jugar.
 
 **Borrar corridas.** Botón "Borrar corrida…" en la app (pide confirmación y no deja borrar una corrida que esté
 usando un proceso), o `rm -r corridas/<nombre>` (borra en el disco de datos, por el enlace).
@@ -231,7 +236,9 @@ mismo nicho; solo el mejor de cada nicho puede ser padre.
 | `ga/entrenar.py` | Bucle de generaciones; guarda `corridas/<nombre>/gen_NNNN.npz` (genomas + trazas por frame) y `metricas.csv` |
 | `ga/almacen.py` | Formato en disco |
 | `ga/recursos.py` | Mapa completo de la room (sin jugador ni `camera`) y sprites del jugador extraídos del .exe |
-| `ga/visualizar.py` | Videos 1920x1080: `generacion` (todos juntos), `mejor` (partida real), `evolucion`, `graficos` |
+| `ga/visualizar.py` | Videos 1920x1080: `generacion` (todos juntos), `mejor` (partida real, recorrido completo por tramos), `evolucion`, `graficos`, `vivo` |
+| `ga/app.py` | Interfaz Qt: lista de corridas, entrenar/continuar/detener, visualizaciones, borrar corridas |
+| `iwbtgb_rl/client.py` | Cliente del emulador; `save`/`load` copian también `save/` (`archivos()`, `restaurar_archivos()`) |
 
 - `camera` mueve la vista en pasos de 800x608, pero la vista mide 800x600: hay 8 px de cada pantalla que nunca
   se ven.
@@ -242,3 +249,38 @@ mismo nicho; solo el mejor de cada nicho puede ser padre.
   arriba a la derecha solo se abren tras vencer a los jefes.
 - Las plataformas móviles (`movingPlatform`, hijas de `platform` → `block`) tapan pasillos en el frame inicial.
 - La posición del jugador puede salir levemente de la room (x = -3e-15): se recorta antes de calcular pantallas.
+
+### Estado de las corridas (2026-10-24)
+
+Todas en `rStage01` → `rStage02`, medium, recompensa `salida`, selección por nichos. "Camino" = mejor fracción
+del camino a la salida alcanzada. Ninguna corrida pasó la primera pantalla (`pantallas_max` = 1) ni superó
+~20,5 %. Las lanza el usuario desde la app; los valores de config son los actuales (pueden haber cambiado al
+continuar).
+
+| Corrida | Agentes / padres | Intento | Reintentos | Save heredado | Gens | Camino máx | Notas |
+|---|---|---|---|---|---|---|---|
+| `150AStage01_00` | 150 / 25 | 120 s | 2 | 30 % | 690 | 19,9 % | Estancada en 18,6 % desde la gen 318 (save de (672,512)); con reintentos y save heredado subió a 19,9 % |
+| `300A_Stage01_01` | 300 / 10 | 120 s | 0 | 0 % (al crearla, >0) | 5000 (terminó) | 20,5 % | 100 % parte de un save desde la gen 5. Sin avance desde la gen ~750; desde la ~2500 los nichos bajaron a 10 (= padres) |
+| `100A_Stage01_01` | 100 / 30 | 120 s | 0 | 0 % | 716 | 9,9 % | Recreada sin reintentos ni save heredado; estancada desde la gen 200 |
+| `50A_Stage01_01` | 50 / 10 | 120 s | 0 | 100 % | 501 (terminó) | 9,8 % | |
+| `200A_30P` | 200 / 30 | 90 s | 1 | 30 % | en curso | — | Lanzada el 2026-10-24 |
+| `test_sala` | 10 / 3 | 60 s | 0 | 100 % | 300 | 3,8 % | Prueba del usuario |
+
+Las corridas de los experimentos 1 y 2 (`rStage01`, `salida01`) ya no existen: el usuario las borró. Sus
+resultados están en el informe.
+
+Lo que se sabe:
+
+- El cuello de botella está pasando el save de (672,512), alrededor del 18–20 % del camino. Los agentes que
+  parten de ahí gastan sus vidas en pocos segundos en el mismo lugar.
+- Con pocos padres (10), la diversidad se pierde: los nichos quedan iguales al número de padres.
+- Disco: ~0,6 GB por cada ~700 generaciones de 150 agentes con intentos de 120 s.
+
+Ideas sin probar:
+
+- Que no todos los hijos de un agente que parte de un save hereden ese save. Por ejemplo, una fracción vuelve al
+  save del abuelo o al comienzo, para no perder rutas alternativas.
+- Nichos que incluyan el save de inicio, o más padres.
+- Re-evaluar la élite al cambiar las reglas a mitad de una corrida. Hoy solo se re-evalúan los agentes cuyos
+  saves no se conocen.
+
