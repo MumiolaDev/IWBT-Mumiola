@@ -153,11 +153,11 @@ def cargar_config(carpeta: Path) -> Config:
     return Config(**d)
 
 
-def agregar_metricas(carpeta: Path, fila: dict) -> None:
+def agregar_metricas(carpeta: Path, fila: dict, campos_nuevos: list[str] = CAMPOS_METRICAS) -> None:
     ruta = carpeta / "metricas.csv"
     nuevo = not ruta.exists()
     # Una corrida vieja conserva sus columnas
-    campos = CAMPOS_METRICAS if nuevo else ruta.open().readline().strip().split(",")
+    campos = campos_nuevos if nuevo else ruta.open().readline().strip().split(",")
     with ruta.open("a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=campos)
         if nuevo:

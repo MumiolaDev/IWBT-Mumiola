@@ -1815,10 +1815,10 @@ index 1f4cded..2dfc013 100644
              components.clock = if spoof_time { time_now } else { GameClock::StartupEpoch(std::time::Instant::now()) };
 diff --git a/gm8exe/src/gm7.rs b/gm8exe/src/gm7.rs
 new file mode 100644
-index 0000000..bc56601
+index 0000000..6a9ba18
 --- /dev/null
 +++ b/gm8exe/src/gm7.rs
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,551 @@
 +//! GameMaker 7.0 executable support.
 +//!
 +//! GM7 executables keep the gamedata at a fixed offset (1980000) and differ from GM8.0 in a few ways:
@@ -1956,7 +1956,12 @@ index 0000000..bc56601
 +    }
 +    let key = if transparent && width > 0 && height > 0 {
 +        let i = (height as usize - 1) * width as usize * 4;
-+        Some([data[i], data[i + 1], data[i + 2]])
++        let bottom_left = [data[i], data[i + 1], data[i + 2]];
++        if std::env::var_os("OPENGMK_GM7_CLAVE_ESQUINA").is_some() {
++            Some(bottom_left) // old behaviour, to replay runs made before the fix
++        } else {
++            Some(padding_row_key(&data, width as usize, height as usize).unwrap_or(bottom_left))
++        }
 +    } else {
 +        None
 +    };
@@ -1964,6 +1969,22 @@ index 0000000..bc56601
 +        px[3] = if key.map_or(false, |k| px[..3] == k) { 0 } else { 255 };
 +    }
 +    Ok(Some((width, height, data.into_boxed_slice())))
++}
++
++/// Some sprites (e.g. sprSpikeUp, 32x33) have an extra bottom row meant
++/// to hold the transparent colour, but in the exe that row is dark, so the bottom-left pixel keys out the outline
++/// instead of the background. The stored alpha byte, though, is 0 over the whole extra row and over the real
++/// background. When the bottom row is entirely alpha 0, use the most common colour among alpha-0 pixels.
++fn padding_row_key(data: &[u8], width: usize, height: usize) -> Option<[u8; 3]> {
++    let row = &data[(height - 1) * width * 4..height * width * 4];
++    if !row.chunks_exact(4).all(|px| px[3] == 0) {
++        return None
++    }
++    let mut counts = std::collections::HashMap::new();
++    for px in data.chunks_exact(4).filter(|px| px[3] == 0) {
++        *counts.entry([px[0], px[1], px[2]]).or_insert(0usize) += 1;
++    }
++    counts.into_iter().max_by_key(|&(colour, n)| (n, colour)).map(|(colour, _)| colour)
 +}
 +
 +fn read_settings(r: &mut Cursor) -> Result<Settings, ReaderError> {

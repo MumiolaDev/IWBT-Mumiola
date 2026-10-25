@@ -192,6 +192,8 @@ def main():
     args = p.parse_args()
 
     carpeta = almacen.dir_corrida(args.nombre)
+    if (carpeta / "explorar.json").exists():
+        sys.exit(f"{carpeta} es una corrida de Go-Explore: usa python -m ga.explorar --nombre {args.nombre} --continuar")
     hechas = almacen.generaciones_guardadas(carpeta) if carpeta.exists() else []
     if hechas and not args.continuar:
         if not args.sobrescribir:

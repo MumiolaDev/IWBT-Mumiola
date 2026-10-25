@@ -250,12 +250,55 @@ mismo nicho; solo el mejor de cada nicho puede ser padre.
 - Las plataformas móviles (`movingPlatform`, hijas de `platform` → `block`) tapan pasillos en el frame inicial.
 - La posición del jugador puede salir levemente de la room (x = -3e-15): se recorta antes de calcular pantallas.
 
-### Estado de las corridas (2026-10-24)
+## Go-Explore (`ga/explorar.py`)
+
+Alternativa al GA para el muro de precisión (ver "Estado de las corridas"): en vez de una población, un archivo
+de celdas. Celda = cuadro de `celda_px` (16) px de la sala + signo de la velocidad vertical (sube, baja, quieto)
++ si queda doble salto (`celda_salto`) + posición relativa de la plataforma móvil más cercana, en cuadros de
+48 px dentro de `radio_plataforma` (160) px (`celda_plataforma`; las plataformas se mueven solas, su recorrido se
+precalcula con `frames_plataformas`). Las corridas viejas siguen sin esas dos partes (`setdefault` en False).
+Para cada celda se guarda el camino más corto (en frames) con que se llegó, como cadena de `Nodo`s (genes y traza
+desde el nodo padre; inmutables, así una celda que mejora no rompe los caminos de sus descendientes).
+
+```bash
+uv run python -m ga.explorar --nombre ge01 --workers 4 --iteraciones 2000
+uv run python -m ga.explorar --nombre ge01 --continuar --iteraciones 5000
+```
+
+- Cada iteración elige `workers × tareas_por_worker` celdas con peso
+  `(1/√(1+elegida) + peso_vista/√(1+vista)) × e^(beta·(progreso − mejor progreso))` y desde cada una prueba
+  `exploraciones` ráfagas de teclas al azar de hasta `frames_exploracion` (100) frames. Morir, irse de la sala o
+  entrar a una zona prohibida corta la ráfaga, pero lo ganado antes queda.
+- Volver a una celda: cada worker guarda `cache` (16) savestates (LRU); si no tiene la celda, carga el ancestro
+  más cercano que tenga (o el comienzo de la sala) y repite los genes. El principal lleva una copia exacta de
+  cada caché y manda cada celda al worker que menos frames tiene que repetir (`frames_repeticion` en las métricas).
+  Cada tarea guarda además una "escala" (un ancestro ≥150 frames antes del destino) para que las celdas vecinas
+  no repitan todo el camino; con `beta` alto (50) sin escalas la caché se saturaba.
+- Sin reintentos ni save points: el savestate ya es "el save".
+- Verificado: los genes de una celda jugados desde el comienzo de la sala reproducen su traza frame a frame
+  (10 de 10).
+- Disco: `config.json` (una `Config` normal, `seleccion = "archivo"`, para que la app y `ga.visualizar` la lean),
+  `explorar.json` (`ConfigExplorar`), `archivo.pkl` (para `--continuar`), `metricas.csv` (una fila por
+  iteración; columnas extra `archivo_celdas`, `nuevas`, `mejoradas`, …) y, cada `guardar_cada` iteraciones,
+  `gen_NNNN.npz` (NNNN = iteración) con las `muestra` (30) celdas más avanzadas y su partida completa, y
+  `graficos/mapa_archivo.png` (celdas coloreadas por iteración de descubrimiento + camino de la mejor).
+  `ga.visualizar mejor/generacion/graficos` funcionan igual.
+- `ga.entrenar` se niega a continuar una corrida que tenga `explorar.json`. La app la lista, pero "Continuar"
+  desde la app no sirve: se lanza por línea de comandos.
+
+## Estado de las corridas (2026-10-25)
 
 Todas en `rStage01` → `rStage02`, medium, recompensa `salida`, selección por nichos. "Camino" = mejor fracción
-del camino a la salida alcanzada. Ninguna corrida pasó la primera pantalla (`pantallas_max` = 1) ni superó
-~20,5 %. Las lanza el usuario desde la app; los valores de config son los actuales (pueden haber cambiado al
-continuar).
+del camino a la salida alcanzada. Las lanza el usuario desde la app; los valores de config son los actuales
+(pueden haber cambiado al continuar).
+
+**El muro del ~20,5 % era un error del emulador**, no del algoritmo: el lector GM7 tomaba mal el color
+transparente de los sprites con una fila extra abajo (`sprSpikeUp` y `sprSpikeRight` de 32×33, entre otros; ver
+`docs/formato-gm7.md`) y la máscara de esas púas era el rectángulo entero. Pasar el muro de púas de (384–416,
+512–576) era imposible. Corregido el 2026-10-25. **Todas las corridas hasta `200A_30P` usan el emulador viejo**:
+para repetirlas (videos) hay que usar el binario respaldado,
+`OPENGMK_EMULATOR=/mnt/datos/iwbtgb/emulador_antiguo/gm8emulator`, o el actual con `OPENGMK_GM7_CLAVE_ESQUINA=1`.
+Con el corregido, sus partidas no se reproducen.
 
 | Corrida | Agentes / padres | Intento | Reintentos | Save heredado | Gens | Camino máx | Notas |
 |---|---|---|---|---|---|---|---|
@@ -263,7 +306,9 @@ continuar).
 | `300A_Stage01_01` | 300 / 10 | 120 s | 0 | 0 % (al crearla, >0) | 5000 (terminó) | 20,5 % | 100 % parte de un save desde la gen 5. Sin avance desde la gen ~750; desde la ~2500 los nichos bajaron a 10 (= padres) |
 | `100A_Stage01_01` | 100 / 30 | 120 s | 0 | 0 % | 716 | 9,9 % | Recreada sin reintentos ni save heredado; estancada desde la gen 200 |
 | `50A_Stage01_01` | 50 / 10 | 120 s | 0 | 100 % | 501 (terminó) | 9,8 % | |
-| `200A_30P` | 200 / 30 | 90 s | 1 | 30 % | en curso | — | Lanzada el 2026-10-24 |
+| `200A_30P` | 200 / 30 | 90 s | 1 | 30 % | 1736 (detenida) | 20,0 % | Detenida al encontrar el error del emulador |
+| `_prueba_ga_alfa` | 200 / 30 | 90 s | 0 | 30 % | 2000 (terminó) | 75,7 % | Prueba con el emulador corregido: 49,8 % en la gen 1800, 75,7 % en la 1999, 5 saves. El mejor final juega 12 frames desde el save 5 y muere: casi todo su avance es heredado |
+| `GA_beta_corregida` | 200 / 50 | 180 s | 0 | 0 % | 43 de 1001 (pausada) | 6,9 % | Emulador corregido; el usuario la sigue desde la app. Hipótesis del usuario: sin herederos también llega, en más generaciones, y el video es una partida continua |
 | `test_sala` | 10 / 3 | 60 s | 0 | 100 % | 300 | 3,8 % | Prueba del usuario |
 
 Las corridas de los experimentos 1 y 2 (`rStage01`, `salida01`) ya no existen: el usuario las borró. Sus
@@ -271,8 +316,12 @@ resultados están en el informe.
 
 Lo que se sabe:
 
-- El cuello de botella está pasando el save de (672,512), alrededor del 18–20 % del camino. Los agentes que
-  parten de ahí gastan sus vidas en pocos segundos en el mismo lugar.
+- El cuello de botella del 18–20 % (pasar el save de (672,512)) era el error de las púas del emulador.
+- Con el save heredado, el video del mejor encadena tramos: el heredero parte del save tras una R (reaparece en
+  el punto del save, con la sala reiniciada y sin velocidad), así que en cada unión hay un salto de 20–40 px.
+  Con `prob_desde_save = 0` y sin reintentos, el video es una sola partida continua.
+- Go-Explore con el emulador corregido (prueba de 4000 iteraciones, ya borrada) llegó al 48,7 %: no logra
+  montarse en la plataforma móvil (288–608, y≈1120) para subir al save de (672,1056).
 - Con pocos padres (10), la diversidad se pierde: los nichos quedan iguales al número de padres.
 - Disco: ~0,6 GB por cada ~700 generaciones de 150 agentes con intentos de 120 s.
 

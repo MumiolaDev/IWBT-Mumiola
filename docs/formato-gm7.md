@@ -77,7 +77,7 @@ Cada sección es `u32 versión_sección, u32 n`, y luego `n` entradas de la form
 |---|---|---|---|
 | sonidos | 400 | nombre, 600, kind, ext, fuente, `existe [blob]`, efectos, f64 vol, f64 pan, preload | **los datos de audio van en zlib** |
 | sprites | 400 | nombre, 542, w, h, bbox l, r, b, t, transparent, smooth, preload, bbox_mode, precise, xorig, yorig, n_frames, frames | sin máscaras de colisión |
-| frame/imagen | — | 540, `i32 existe (-1 = no)`, w, h, blob zlib | píxeles **BGR + byte 0** (sin alpha); la transparencia es por color clave (pixel inferior izquierdo) |
+| frame/imagen | — | 540, `i32 existe (-1 = no)`, w, h, blob zlib | píxeles **BGR + 4.º byte** (0 en el fondo, 255 en el resto; GM7 no lo usa como alfa); la transparencia es por color clave: pixel inferior izquierdo, salvo la excepción de abajo |
 | fondos | 400 | nombre, 543, w, h, transparent, smooth, preload, `existe [imagen]` | igual que la imagen anterior |
 | paths | 420 | nombre, 530, kind, closed, precision, n, (f64 x, y, speed)×n | igual a GM8 |
 | scripts | 400 | nombre, 400, blob | **blob = zlib → sustitución con seed 12345 → `str`** |
@@ -85,6 +85,15 @@ Cada sección es `u32 versión_sección, u32 n`, y luego `n` entradas de la form
 | timelines | 500 | nombre, 500, n, (u32 momento, acciones)×n | igual |
 | objetos | 400 | nombre, 430, sprite, solid, visible, depth, persistent, parent, mask, **u32 10**, listas | 11 listas (eventos 0..10), no hay *trigger*; cada lista es `(i32 sub, acciones)*` y termina en `-1` |
 | rooms | 420 | nombre, 541, caption, w, h, speed, persistent, colour, draw_colour, código, 8 fondos ×10 u32, views_enabled, 8 vistas ×14 u32, instancias (x, y, obj, id, código), tiles ×9 u32 | igual al exe de GM8.0 |
+
+**Color clave con fila de relleno.** Algunos sprites tienen una fila extra abajo (`sprSpikeUp` y `sprSpikeRight`
+de 32×33, `maskSpikeShort`, `sprSpikeUpMini`, `sprSpikeUpSuperBig`, `sprBoundSpike`, …). En el exe esa fila es
+oscura, así que el pixel inferior izquierdo borra el contorno y deja opaco el fondo turquesa (192,192,0): la
+máscara de colisión queda rectangular. El 4.º byte sí marca el fondo real. Regla (`padding_row_key` en
+`gm7.rs`): si la fila inferior entera tiene ese byte en 0, la clave es el color más común entre los píxeles con
+byte 0. Con `OPENGMK_GM7_CLAVE_ESQUINA=1` se vuelve a la regla vieja (para repetir corridas anteriores). La
+regla también cambia `sprLife`, `sprCommand`, `sprSpringLeft[4]`, `sprWarning03` y `sprMoguraAna`; no se
+revisó si esos cambios son correctos.
 
 **Acciones** (en eventos y timelines): `u32 400, u32 n`, y por cada acción:
 `440, lib, id, kind, may_be_relative, question, applies, exe_type, str función, str código, u32 argc,

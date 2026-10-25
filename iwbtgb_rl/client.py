@@ -15,7 +15,9 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EMULATOR = ROOT / "vendor" / "OpenGMK" / "target" / "release" / "gm8emulator"
+# OPENGMK_EMULATOR: otro binario del emulador (p. ej. un build experimental en otra carpeta)
+DEFAULT_EMULATOR = Path(os.environ.get("OPENGMK_EMULATOR")
+                        or ROOT / "vendor" / "OpenGMK" / "target" / "release" / "gm8emulator")
 DEFAULT_GAME = ROOT / "game" / "i_wanna_be_the_GB.exe"
 
 OP_STEP, OP_SAVE, OP_LOAD, OP_OBS, OP_QUERY, OP_INFO, OP_EXEC, OP_TRACK, OP_QUIT = 1, 2, 3, 4, 5, 6, 7, 8, 255

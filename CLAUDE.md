@@ -8,7 +8,7 @@ La app Android de fangames (hub con rankings, *I Wanna be the Guy: Remastered*) 
 propio repo: `~/Programacion/FangameHub`. Allí se trabaja en otra sesión. Cada repo tiene su propia copia de
 OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llevarlo a mano al otro.
 
-## Estado (2026-10-24)
+## Estado (2026-10-25)
 
 - El GB corre nativo (`./scripts/jugar.sh`). El RL con PPO nunca se entrenó; el trabajo actual es un algoritmo
   genético (`ga/`) para un video de YouTube. El usuario lo maneja desde la app Qt (`ga.app`) y lanza sus propias
@@ -22,9 +22,12 @@ OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llev
   - save heredado: los hijos parten del save que activó su padre (`prob_desde_save`), y el video del mejor
     muestra el recorrido completo por tramos.
 - Corridas: `corridas/` es un enlace a `/mnt/datos/iwbtgb/corridas` (disco de datos). Estado y lo aprendido de
-  cada una en `docs/entorno-rl.md` → "Estado de las corridas". Ninguna pasó del ~20,5 % del camino de
-  `rStage01`. No borrar ni modificar corridas del usuario. Para pruebas, crear una aparte (`_prueba_*`) y
-  borrarla al terminar.
+  cada una en `docs/entorno-rl.md` → "Estado de las corridas". El tope del ~20,5 % era un error del emulador
+  (máscara rectangular de las púas, corregido el 2026-10-25); con la corrección, una prueba llegó al 75,7 %.
+  Las corridas anteriores a la corrección se repiten con el binario viejo:
+  `OPENGMK_EMULATOR=/mnt/datos/iwbtgb/emulador_antiguo/gm8emulator` (o `OPENGMK_GM7_CLAVE_ESQUINA=1`).
+  No borrar ni modificar corridas del usuario. Para pruebas, crear una aparte (`_prueba_*`) y borrarla al
+  terminar.
 - Compatibilidad: cada regla nueva tiene un valor por defecto "apagado" para corridas viejas
   (`almacen.cargar_config`, `setdefault`). La app abierta usa el código con el que se abrió. Los entrenamientos
   que lanza son procesos nuevos, así que usan el código del disco. Tras cambiar `Config`, hay que cerrar y
@@ -48,6 +51,7 @@ uv run python -m ga.app                                           # interfaz (Qt
 uv run python -m ga.entrenar --nombre salida01 [--continuar]       # algoritmo genético (opciones = campos de Config)
 uv run python -m ga.visualizar todo --corrida salida01 --cada 10   # videos y gráficos de la corrida
 uv run python -m ga.visualizar vivo --corrida salida01             # ventana (ffplay) con la última generación, mientras entrena
+uv run python -m ga.explorar --nombre ge01 --workers 4 --iteraciones 2000   # Go-Explore (archivo de celdas); --continuar
 ```
 
 Rust: se usa el rustc del sistema (1.99, sin rustup). `rust-toolchain.toml` pide 1.77, pero sin rustup se
@@ -57,7 +61,7 @@ ignora. Python: `uv` con `.venv` (numpy, gymnasium, pillow, matplotlib y pyside6
 
 | Archivo | Cambio |
 |---|---|
-| `gm8exe/src/gm7.rs` (nuevo) | Lector GM7. Devuelve `GameAssets` marcados como `GameMaker8_0` |
+| `gm8exe/src/gm7.rs` (nuevo) | Lector GM7. Devuelve `GameAssets` marcados como `GameMaker8_0`. Color clave corregido para sprites con fila de relleno (`padding_row_key`; regla vieja con `OPENGMK_GM7_CLAVE_ESQUINA`) |
 | `gm8exe/src/reader.rs`, `lib.rs` | Detecta GM7 (offset 1980000, versión 700) antes de buscar GM8 |
 | `gm8emulator/src/game/rl.rs` (nuevo) | Servidor RL: STEP (con trazas por frame, `no_draw` y corte al morir), SAVE, LOAD, OBS, QUERY, INFO, EXEC, TRACK y QUIT |
 | `gm8emulator/src/game.rs` | `PlayType::Rl`: sin audio, ventana oculta salvo con `OPENGMK_RL_SHOW` |
