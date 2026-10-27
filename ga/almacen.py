@@ -167,4 +167,4 @@ def agregar_metricas(carpeta: Path, fila: dict, campos_nuevos: list[str] = CAMPO
 
 def leer_metricas(carpeta: Path) -> list[dict]:
     with (carpeta / "metricas.csv").open() as f:
-        return [{k: float(v) for k, v in fila.items()} for fila in csv.DictReader(f)]
+        return [{k: float(v) for k, v in fila.items() if v != ""} for fila in csv.DictReader(f)]

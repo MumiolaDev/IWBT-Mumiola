@@ -1294,10 +1294,10 @@ index 0000000..d0e2fcd
 +}
 diff --git a/gm8emulator/src/game/rl.rs b/gm8emulator/src/game/rl.rs
 new file mode 100644
-index 0000000..a767f5a
+index 0000000..f0c11ce
 --- /dev/null
 +++ b/gm8emulator/src/game/rl.rs
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,579 @@
 +//! Frame-by-frame control of the game by an external reinforcement learning client.
 +//!
 +//! The emulator listens on a Unix socket and serves one client. Every request starts with a one-byte
@@ -1348,11 +1348,34 @@ index 0000000..a767f5a
 +const OP_INFO: u8 = 6;
 +const OP_EXEC: u8 = 7;
 +const OP_TRACK: u8 = 8;
++const OP_GRID_CONFIG: u8 = 9;
++const OP_GRID: u8 = 10;
 +const OP_QUIT: u8 = 255;
 +
 +const STATUS_OK: u8 = 0;
 +const STATUS_ENDED: u8 = 1;
 +const STATUS_ERROR: u8 = 2;
++
++/// Semantic view: an egocentric grid around the tracked instance, one channel per group of objects (with their
++/// children), each cell holding the fraction (0-255) of its sample points inside an instance's collision mask.
++#[derive(Default)]
++struct Grid {
++    channels: Vec<Channel>,
++    fields: Vec<usize>,              // instance variables of the tracked instance to report (e.g. djump)
++    cell: i32,
++    width: usize,
++    height: usize,
++    samples: i32, // sample points per axis per cell
++    centre: (i32, i32),
++}
++
++struct Channel {
++    objects: Vec<i32>, // with their children
++    exclude: Vec<i32>, // children of these are left out (e.g. one-way platforms are children of block)
++    visible_only: bool,
++}
++
++const STEP_GRID: u8 = 32;
 +
 +fn write_str(w: &mut impl Write, s: &[u8]) -> io::Result<()> {
 +    let s = &s[..s.len().min(u16::MAX as usize)];
@@ -1450,6 +1473,132 @@ index 0000000..a767f5a
 +        (false, 0.0, 0.0, -1, 0.0, 0.0)
 +    }
 +
++    /// Marks in `out` (one channel, row-major) the cells covered by an instance's collision mask.
++    fn rl_grid_instance(&self, handle: usize, grid: &Grid, left: i32, top: i32, out: &mut [u8]) {
++        let inst = self.room.instance_list.get(handle);
++        let mask = if inst.mask_index.get() < 0 { inst.sprite_index.get() } else { inst.mask_index.get() };
++        let sprite = match self.assets.sprites.get_asset(mask) {
++            Some(s) => s.as_ref(),
++            None => return,
++        };
++        inst.update_bbox(Some(sprite));
++        let collider = match if sprite.per_frame_colliders {
++            sprite.colliders.get(inst.image_index.get().floor().into_inner() as usize % sprite.colliders.len())
++        } else {
++            sprite.colliders.first()
++        } {
++            Some(c) => c,
++            None => return,
++        };
++        let (bl, br, bt, bb) =
++            (inst.bbox_left.get(), inst.bbox_right.get(), inst.bbox_top.get(), inst.bbox_bottom.get());
++        let cell = grid.cell;
++        let gx0 = (bl - left).div_euclid(cell).max(0);
++        let gx1 = (br - left).div_euclid(cell).min(grid.width as i32 - 1);
++        let gy0 = (bt - top).div_euclid(cell).max(0);
++        let gy1 = (bb - top).div_euclid(cell).min(grid.height as i32 - 1);
++        if gx0 > gx1 || gy0 > gy1 {
++            return
++        }
++        let inst_x = inst.x.get().round().to_i32();
++        let inst_y = inst.y.get().round().to_i32();
++        let angle = inst.image_angle.get().to_radians();
++        let (sin, cos) = (angle.sin().into_inner(), angle.cos().into_inner());
++        let (xscale, yscale) = (inst.image_xscale.get(), inst.image_yscale.get());
++        let n = grid.samples;
++        for gy in gy0..=gy1 {
++            for gx in gx0..=gx1 {
++                let mut hits = 0;
++                for sy in 0..n {
++                    let py = top + gy * cell + (2 * sy + 1) * cell / (2 * n);
++                    if py < bt || py > bb {
++                        continue
++                    }
++                    for sx in 0..n {
++                        let px = left + gx * cell + (2 * sx + 1) * cell / (2 * n);
++                        if px >= bl
++                            && px <= br
++                            && collider.check_collision_point_precise(
++                                px, py, inst_x, inst_y, sprite.origin_x, sprite.origin_y, xscale, yscale, sin, cos,
++                            )
++                        {
++                            hits += 1;
++                        }
++                    }
++                }
++                let value = (hits * 255 / (n * n)) as u8;
++                let o = &mut out[gy as usize * grid.width + gx as usize];
++                if value > *o {
++                    *o = value;
++                }
++            }
++        }
++    }
++
++    /// Writes the grid: room, centre, whether the tracked instance exists, its hspeed, vspeed and reported fields,
++    /// then channels × height × width bytes. Centred on the tracked instance (or where it was last seen).
++    fn rl_write_grid(&self, grid: &mut Grid, tracked: Option<i32>, w: &mut impl Write) -> io::Result<()> {
++        let mut player = None;
++        if let Some(object_index) = tracked {
++            let mut iter = self.room.instance_list.iter_by_identity(object_index);
++            while let Some(handle) = iter.next(&self.room.instance_list) {
++                if self.room.instance_list.get(handle).state.get() == InstanceState::Active {
++                    player = Some(handle);
++                    break
++                }
++            }
++        }
++        let mut speeds = (0.0, 0.0);
++        let mut fields = vec![f64::NAN; grid.fields.len()];
++        if let Some(handle) = player {
++            let inst = self.room.instance_list.get(handle);
++            grid.centre = (inst.x.get().round().to_i32(), inst.y.get().round().to_i32());
++            speeds = (f64::from(inst.hspeed.get()), f64::from(inst.vspeed.get()));
++            let inst_fields = inst.fields.borrow();
++            for (value, id) in fields.iter_mut().zip(&grid.fields) {
++                if let Some(Value::Real(r)) = inst_fields.get(id).and_then(|f| f.get(0)) {
++                    *value = r.into();
++                }
++            }
++        }
++        let left = grid.centre.0 - grid.width as i32 * grid.cell / 2;
++        let top = grid.centre.1 - grid.height as i32 * grid.cell / 2;
++        let size = grid.width * grid.height;
++        let mut out = vec![0u8; grid.channels.len() * size];
++        for (c, channel) in grid.channels.iter().enumerate() {
++            let mut seen = std::collections::HashSet::new();
++            for &object_index in &channel.objects {
++                let mut iter = self.room.instance_list.iter_by_identity(object_index);
++                while let Some(handle) = iter.next(&self.room.instance_list) {
++                    let inst = self.room.instance_list.get(handle);
++                    if inst.state.get() != InstanceState::Active || !seen.insert(handle) {
++                        continue
++                    }
++                    if channel.visible_only && (!inst.visible.get() || inst.image_alpha.get() <= 0.into()) {
++                        continue
++                    }
++                    if !channel.exclude.is_empty() {
++                        let parents = inst.parents.borrow();
++                        if channel.exclude.iter().any(|e| parents.contains(e)) {
++                            continue
++                        }
++                    }
++                    self.rl_grid_instance(handle, grid, left, top, &mut out[c * size..(c + 1) * size]);
++                }
++            }
++        }
++        w.write_i32::<LE>(self.room.id)?;
++        w.write_i32::<LE>(grid.centre.0)?;
++        w.write_i32::<LE>(grid.centre.1)?;
++        w.write_u8(player.is_some() as u8)?;
++        w.write_f64::<LE>(speeds.0)?;
++        w.write_f64::<LE>(speeds.1)?;
++        for value in fields {
++            w.write_f64::<LE>(value)?;
++        }
++        w.write_all(&out)
++    }
++
 +    fn rl_object_index(&self, name: &[u8]) -> Option<i32> {
 +        self.assets.objects.iter().position(|o| o.as_ref().map_or(false, |o| o.name.as_ref() == name)).map(|i| i as i32)
 +    }
@@ -1483,6 +1632,7 @@ index 0000000..a767f5a
 +        let mut saves: HashMap<u32, (SaveState, BTreeSet<u8>)> = HashMap::new();
 +        let mut frame: u64 = 0;
 +        let mut tracked: Option<i32> = None;
++        let mut grid = Grid::default();
 +        let mut trace: Vec<(i32, (bool, f32, f32, i32, f32, f32))> = Vec::new();
 +
 +        loop {
@@ -1505,6 +1655,7 @@ index 0000000..a767f5a
 +                    let want_trace = flags & 4 != 0;
 +                    let no_draw = flags & 8 != 0;
 +                    let stop_on_gone = flags & 16 != 0;
++                    let want_grid = flags & STEP_GRID != 0;
 +                    trace.clear();
 +
 +                    for &k in held.difference(&keys) {
@@ -1575,6 +1726,53 @@ index 0000000..a767f5a
 +                            writer.write_f32::<LE>(xscale)?;
 +                        }
 +                    }
++                    if want_grid {
++                        self.rl_write_grid(&mut grid, tracked, &mut writer)?;
++                    }
++                },
++                OP_GRID_CONFIG => {
++                    // cell px, width, height, samples per axis; channels: flags (1 = visible only), object
++                    // names and excluded object names; then names of the tracked instance's fields to report
++                    let cell = reader.read_u8()?.max(1) as i32;
++                    let width = reader.read_u16::<LE>()? as usize;
++                    let height = reader.read_u16::<LE>()? as usize;
++                    let samples = reader.read_u8()?.max(1) as i32;
++                    let mut missing = Vec::new();
++                    let mut channels = Vec::new();
++                    for _ in 0..reader.read_u8()? {
++                        let visible_only = reader.read_u8()? & 1 != 0;
++                        let mut lists = [Vec::new(), Vec::new()];
++                        for list in lists.iter_mut() {
++                            for _ in 0..reader.read_u8()? {
++                                let len = reader.read_u16::<LE>()? as usize;
++                                let mut name = vec![0u8; len];
++                                reader.read_exact(&mut name)?;
++                                match self.rl_object_index(&name) {
++                                    Some(i) => list.push(i),
++                                    None => missing.push(name),
++                                }
++                            }
++                        }
++                        let [objects, exclude] = lists;
++                        channels.push(Channel { objects, exclude, visible_only });
++                    }
++                    let mut fields = Vec::new();
++                    for _ in 0..reader.read_u8()? {
++                        let len = reader.read_u16::<LE>()? as usize;
++                        let mut name = vec![0u8; len];
++                        reader.read_exact(&mut name)?;
++                        fields.push(self.compiler.get_field_id(&name));
++                    }
++                    grid = Grid { channels, fields, cell, width, height, samples, centre: grid.centre };
++                    writer.write_u8(STATUS_OK)?;
++                    writer.write_u16::<LE>(missing.len() as u16)?;
++                    for name in missing {
++                        write_str(&mut writer, &name)?;
++                    }
++                },
++                OP_GRID => {
++                    writer.write_u8(STATUS_OK)?;
++                    self.rl_write_grid(&mut grid, tracked, &mut writer)?;
 +                },
 +                OP_TRACK => {
 +                    let len = reader.read_u16::<LE>()? as usize;

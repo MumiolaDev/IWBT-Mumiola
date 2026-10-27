@@ -236,7 +236,7 @@ mismo nicho; solo el mejor de cada nicho puede ser padre.
 | `ga/entrenar.py` | Bucle de generaciones; guarda `corridas/<nombre>/gen_NNNN.npz` (genomas + trazas por frame) y `metricas.csv` |
 | `ga/almacen.py` | Formato en disco |
 | `ga/recursos.py` | Mapa completo de la room (sin jugador ni `camera`) y sprites del jugador extraídos del .exe |
-| `ga/visualizar.py` | Videos 1920x1080: `generacion` (todos juntos), `mejor` (partida real, recorrido completo por tramos), `evolucion`, `graficos`, `vivo` |
+| `ga/visualizar.py` | Videos 1920x1080: `generacion` (todos juntos), `mejor` (partida real, recorrido completo por tramos), `evolucion`, `graficos`, `vivo`. `vivo` aguanta horas (stream): corre en un scope de systemd con `MemoryMax=1500M` sin swap, ffplay muere con él (`-autoexit` + `PR_SET_PDEATHSIG`) y se reinicia si pasa de 800 MB, y cada 10 min escribe una línea con la memoria |
 | `ga/app.py` | Interfaz Qt: lista de corridas, entrenar/continuar/detener, visualizaciones, borrar corridas |
 | `iwbtgb_rl/client.py` | Cliente del emulador; `save`/`load` copian también `save/` (`archivos()`, `restaurar_archivos()`) |
 

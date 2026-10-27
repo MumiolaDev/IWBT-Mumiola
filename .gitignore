@@ -8,6 +8,8 @@
 
 # Resultados de entrenamientos (enlace a /mnt/datos/iwbtgb/corridas)
 /corridas
+# Corridas de las redes neuronales (enlace a /mnt/datos/iwbtgb/corridas_redes)
+/corridas_redes
 
 .venv/
 __pycache__/

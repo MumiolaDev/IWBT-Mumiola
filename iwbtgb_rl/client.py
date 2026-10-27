@@ -21,6 +21,8 @@ DEFAULT_EMULATOR = Path(os.environ.get("OPENGMK_EMULATOR")
 DEFAULT_GAME = ROOT / "game" / "i_wanna_be_the_GB.exe"
 
 OP_STEP, OP_SAVE, OP_LOAD, OP_OBS, OP_QUERY, OP_INFO, OP_EXEC, OP_TRACK, OP_QUIT = 1, 2, 3, 4, 5, 6, 7, 8, 255
+OP_GRID_CONFIG, OP_GRID = 9, 10
+STEP_GRID = 32
 STATUS_OK, STATUS_ENDED, STATUS_ERROR = 0, 1, 2
 
 # Códigos de tecla virtual de Windows, los que usa GameMaker
@@ -39,6 +41,25 @@ TRACE_DTYPE = np.dtype([
 ])
 
 
+def limpiar_huerfanos(minutos: float = 10.0) -> None:
+    """Borra las carpetas iwbtgb_* de emuladores que ya no existen (un proceso muerto sin close() las deja, y /tmp
+    suele estar en RAM). Huérfana = su socket no acepta conexiones, o no tiene socket y tiene más de `minutos`."""
+    for d in Path(tempfile.gettempdir()).glob("iwbtgb_*"):
+        sock = d / "rl.sock"
+        try:
+            if sock.exists():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.connect(str(sock))
+                continue  # hay un emulador escuchando
+            if time.time() - d.stat().st_mtime < minutos * 60:
+                continue  # recién creada: su emulador puede estar arrancando
+        except ConnectionRefusedError:
+            pass
+        except OSError:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class EmulatorError(RuntimeError):
     pass
 
@@ -50,10 +71,23 @@ class StepResult:
     frame: int
     obs: np.ndarray | None
     trace: np.ndarray | None = None
+    grid: Grid | None = None
 
     @property
     def ended(self) -> bool:
         return self.status == STATUS_ENDED
+
+
+@dataclass
+class Grid:
+    """Vista semántica alrededor del objeto de `track()` (ver `grid_config`)."""
+    room: int
+    centro: tuple[int, int]      # píxel de la room en el centro de la grilla
+    vivo: bool                   # existe el objeto seguido (si no, la grilla queda donde se lo vio por última vez)
+    hspeed: float
+    vspeed: float
+    campos: tuple[float, ...]    # variables pedidas del objeto seguido (NaN si no son números)
+    canales: np.ndarray          # uint8 (canales, alto, ancho): fracción de cada celda cubierta, 0-255
 
 
 @dataclass
@@ -91,8 +125,10 @@ class Emulator:
         verbose: bool = False,
         startup_timeout: float = 60.0,
     ):
+        limpiar_huerfanos()
         self.workdir = Path(tempfile.mkdtemp(prefix="iwbtgb_"))
         self._archivos: dict[int, dict[str, bytes]] = {}
+        self._grid = (0, 0, 0, 0)  # canales, alto, ancho, campos (de grid_config)
         exe = self.workdir / Path(game).name
         shutil.copy2(game, exe)
         self.socket_path = self.workdir / "rl.sock"
@@ -158,16 +194,20 @@ class Emulator:
         trace: bool = False,
         no_draw: bool = False,
         stop_on_gone: bool = False,
+        grid: bool = False,
     ) -> StepResult:
         """Mantiene presionadas `keys` (nombres de VK o códigos) durante `frames` frames.
 
         Con `skip_draw` solo se dibuja el último frame: bastante más rápido, pero los eventos Draw
         de los frames intermedios no se ejecutan (si el juego tiene lógica ahí, cambia su comportamiento).
         `no_draw` no dibuja ninguno. `trace` devuelve un registro por frame (`TRACE_DTYPE`) del objeto
-        elegido con `track()`, y `stop_on_gone` corta el paso en cuanto ese objeto deja de existir.
+        elegido con `track()`, y `stop_on_gone` corta el paso en cuanto ese objeto deja de existir. `grid`
+        devuelve la vista semántica tras el último frame (configurada con `grid_config`).
         """
         codes = sorted({VK[k] if isinstance(k, str) else int(k) for k in keys})
         flags = int(obs) | (int(skip_draw) << 1) | (int(trace) << 2) | (int(no_draw) << 3) | (int(stop_on_gone) << 4)
+        if grid:
+            flags |= STEP_GRID
         self._send(struct.pack(f"<BB{len(codes)}BIB", OP_STEP, len(codes), *codes, frames, flags))
         (status,) = self._unpack("<B")
         if status == STATUS_ERROR:
@@ -179,7 +219,45 @@ class Emulator:
         if trace:
             (n,) = self._unpack("<I")
             records = np.frombuffer(self._recv(n * TRACE_DTYPE.itemsize), dtype=TRACE_DTYPE)
-        return StepResult(status, room, frame, image, records)
+        return StepResult(status, room, frame, image, records, self._recv_grid() if grid else None)
+
+    def grid_config(self, celda: int, ancho: int, alto: int, muestras: int,
+                    canales: list[tuple[list[str], list[str], bool]], campos: list[str] = ()) -> list[str]:
+        """Configura la vista semántica: grilla de `ancho`×`alto` celdas de `celda` px centrada en el objeto de
+        `track()`. Cada canal es (objetos, excluidos, solo_visibles): una celda vale la fracción de sus
+        `muestras`×`muestras` puntos que cae dentro de la máscara de colisión de alguna instancia de esos objetos
+        o sus hijos, salvo hijos de los excluidos. `campos` son variables del objeto seguido que se devuelven
+        (p. ej. "djump"). Devuelve los nombres de objetos que no existen en el juego."""
+        def nombres(lista) -> bytes:
+            out = struct.pack("<B", len(lista))
+            for n in lista:
+                b = n.encode("shift_jis")
+                out += struct.pack("<H", len(b)) + b
+            return out
+        datos = struct.pack("<BBHHB", OP_GRID_CONFIG, celda, ancho, alto, muestras) + struct.pack("<B", len(canales))
+        for objetos, excluidos, solo_visibles in canales:
+            datos += struct.pack("<B", int(solo_visibles)) + nombres(objetos) + nombres(excluidos)
+        datos += nombres(list(campos))
+        self._send(datos)
+        if self._unpack("<B")[0] != STATUS_OK:
+            raise EmulatorError("no se pudo configurar la grilla")
+        (n,) = self._unpack("<H")
+        self._grid = (len(canales), alto, ancho, len(campos))
+        return [self._recv_str().decode("shift_jis", "replace") for _ in range(n)]
+
+    def grid(self) -> Grid:
+        """Vista semántica del frame actual."""
+        self._send(struct.pack("<B", OP_GRID))
+        if self._unpack("<B")[0] != STATUS_OK:
+            raise EmulatorError("no se pudo leer la grilla")
+        return self._recv_grid()
+
+    def _recv_grid(self) -> Grid:
+        c, h, w, k = self._grid
+        room, cx, cy, vivo, hs, vs = self._unpack("<iiiBdd")
+        campos = self._unpack(f"<{k}d") if k else ()
+        canales = np.frombuffer(self._recv(c * h * w), dtype=np.uint8).reshape(c, h, w)
+        return Grid(room, (cx, cy), bool(vivo), hs, vs, tuple(campos), canales)
 
     def track(self, object_name: str = "player") -> None:
         """Elige el objeto cuya primera instancia describen las trazas de `step(trace=True)`."""

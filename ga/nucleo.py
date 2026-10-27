@@ -16,7 +16,9 @@ Hay dos recompensas (`Config.recompensa`):
 
 from __future__ import annotations
 
+import multiprocessing.util
 import os
+import signal
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -181,6 +183,23 @@ def iniciar_worker(cfg: Config) -> None:
         difficulty=cfg.difficulty, start_room=cfg.start_room, obs_type="state", seed=cfg.seed_juego
     )
     _env.emu.track("player")
+    # Sin cerrar el emulador, su carpeta queda en /tmp (en RAM). El worker sale normal cuando el pool le manda el
+    # centinela (Finalize) o con SIGTERM si Pool.terminate() lo mata antes
+    multiprocessing.util.Finalize(None, _cerrar_env, exitpriority=10)
+    signal.signal(signal.SIGTERM, _sigterm_worker)
+
+
+def _cerrar_env() -> None:
+    global _env
+    if _env is not None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # el pool suele mandarlo mientras se cierra: que termine
+        env, _env = _env, None
+        env.close()
+
+
+def _sigterm_worker(*_) -> None:
+    _cerrar_env()
+    os._exit(0)
 
 
 MAX_SLOTS = 6  # savestates por familia (~11 MB cada uno)

@@ -13,13 +13,22 @@ corridas/<nombre>/videos/ y los gráficos en corridas/<nombre>/graficos/. `--vel
 `vivo` sirve mientras se entrena (en otra terminal): muestra en una ventana (ffplay) todos los agentes de la
 última generación guardada, acelerados (`--velocidad`, 4 por defecto); al terminar salta a la más nueva,
 saltándose las intermedias. Se cierra cerrando la ventana o con Ctrl+C.
+
+Para dejarlo horas (stream): corre dentro de un scope de systemd con `MemoryMax` (`LIMITE_VIVO`), así una fuga
+mata solo al en vivo en vez de congelar el computador; ffplay muere con él, se reinicia si su memoria pasa de
+`LIMITE_FFPLAY`, y cada 10 min se escribe una línea con la memoria (para diagnosticar).
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 import shutil
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -75,11 +84,12 @@ class Ventana:
     def __init__(self, titulo: str, fps: int = FPS, ancho: int = 1280):
         if shutil.which("ffplay") is None:
             raise SystemExit("ffplay no está instalado (viene con ffmpeg)")
+        # -autoexit y PDEATHSIG: si el proceso de Python muere (aunque sea con SIGKILL), ffplay no queda huérfano
         self.proc = subprocess.Popen(
-            ["ffplay", "-loglevel", "error", "-window_title", titulo, "-x", str(ancho), "-y", str(ancho * H // W),
-             "-fflags", "nobuffer", "-f", "rawvideo", "-pixel_format", "rgb24", "-video_size", f"{W}x{H}",
-             "-framerate", str(fps), "-i", "-"],
-            stdin=subprocess.PIPE,
+            ["ffplay", "-loglevel", "error", "-nostats", "-autoexit", "-an", "-sn", "-window_title", titulo,
+             "-x", str(ancho), "-y", str(ancho * H // W), "-fflags", "nobuffer", "-f", "rawvideo",
+             "-pixel_format", "rgb24", "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "-"],
+            stdin=subprocess.PIPE, preexec_fn=_morir_con_el_padre,
         )
 
     def escribir(self, img: Image.Image) -> bool:
@@ -93,12 +103,44 @@ class Ventana:
     def abierta(self) -> bool:
         return self.proc.poll() is None
 
+    def memoria_mb(self) -> float:
+        return memoria_mb(self.proc.pid)
+
     def cerrar(self) -> None:
         try:
             self.proc.stdin.close()
         except OSError:
             pass
         self.proc.terminate()
+        try:
+            self.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def _morir_con_el_padre() -> None:
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+
+def memoria_mb(pid: int | str = "self") -> float:
+    """RSS de un proceso en MB (0 si ya no existe)."""
+    try:
+        for linea in open(f"/proc/{pid}/status"):
+            if linea.startswith("VmRSS:"):
+                return int(linea.split()[1]) / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def memoria_libre_mb() -> float:
+    for linea in open("/proc/meminfo"):
+        if linea.startswith("MemAvailable:"):
+            return int(linea.split()[1]) / 1024
+    return 0.0
 
 
 class Video:
@@ -378,14 +420,51 @@ def video_generacion(corrida: str, gen: int, velocidad: int = 1, salida: Path | 
     return salida
 
 
+LIMITE_VIVO = "1500M"   # tope de memoria del en vivo completo (Python + ffplay), vía systemd-run
+LIMITE_FFPLAY = 800      # MB: sobre esto se reinicia la ventana
+REPORTE_CADA = 600       # s entre líneas de estado
+
+
+def _con_tope_de_memoria(modulo: str = "ga.visualizar") -> None:
+    """Se vuelve a ejecutar dentro de un scope de systemd con MemoryMax (sin swap): si algo crece sin control, el
+    kernel mata solo a este proceso. Sin systemd-run sigue igual, sin tope."""
+    if os.environ.get("IWBTGB_VIVO_SCOPE") or shutil.which("systemd-run") is None:
+        return
+    os.environ["IWBTGB_VIVO_SCOPE"] = "1"
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={LIMITE_VIVO}", "-p",
+           "MemorySwapMax=0", sys.executable, "-m", modulo, *sys.argv[1:]]
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError:
+        pass
+
+
+def _terminar(*_) -> None:
+    raise KeyboardInterrupt  # SIGTERM (p. ej. el kill del scope): se cierra ffplay igual que con Ctrl+C
+
+
 def vivo(corrida: str, velocidad: int = 4) -> None:
     """Ventana que reproduce la última generación guardada y salta a la siguiente cuando aparece."""
-    import time
+    signal.signal(signal.SIGTERM, _terminar)
     carpeta = almacen.dir_corrida(corrida)
-    ventana = Ventana(f"{corrida} · en vivo (x{velocidad})")
+    titulo = f"{corrida} · en vivo (x{velocidad})"
+    ventana = Ventana(titulo)
     mostrada = -1
+    inicio = ultimo_reporte = time.monotonic()
+    print(f"en vivo: {corrida} (tope de memoria {LIMITE_VIVO if os.environ.get('IWBTGB_VIVO_SCOPE') else 'ninguno'})",
+          flush=True)
     try:
         while ventana.abierta():
+            ahora = time.monotonic()
+            if ahora - ultimo_reporte >= REPORTE_CADA:
+                ultimo_reporte = ahora
+                print(f"en vivo: {(ahora - inicio) / 3600:.1f} h · gen {mostrada} · memoria {memoria_mb():.0f} MB "
+                      f"+ ffplay {ventana.memoria_mb():.0f} MB · libre en el sistema "
+                      f"{memoria_libre_mb() / 1024:.1f} GB", flush=True)
+            if ventana.memoria_mb() > LIMITE_FFPLAY:
+                print(f"en vivo: ffplay usa {ventana.memoria_mb():.0f} MB; se reinicia la ventana", flush=True)
+                ventana.cerrar()
+                ventana = Ventana(titulo)
             gens = almacen.generaciones_guardadas(carpeta) if carpeta.exists() else []
             if not gens or gens[-1] == mostrada:
                 time.sleep(1)
@@ -401,6 +480,7 @@ def vivo(corrida: str, velocidad: int = 4) -> None:
             for img in cuadros_generacion(carpeta, cfg, gen, pob, velocidad, en_vivo=True):
                 if not ventana.escribir(img):
                     return
+            del pob
     except KeyboardInterrupt:
         pass
     finally:
@@ -879,6 +959,7 @@ def main():
                    help="frames del juego por frame de video (1 por defecto; 4 en vivo)")
     a = p.parse_args()
     if a.modo == "vivo":
+        _con_tope_de_memoria()
         vivo(a.corrida, a.velocidad or 4)
         return
     a.velocidad = a.velocidad or 1

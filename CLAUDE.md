@@ -34,6 +34,14 @@ OpenGMK y su propio parche: un cambio al emulador que sirva a ambos hay que llev
   reabrir la app.
 - Informe del experimento (artifact): https://claude.ai/artifact/XBoYLppCkJP2CkYwzmkP8E. Cubre los exp. 1–2;
   aún no incluye reintentos ni save heredado.
+- **Proyecto aparte: redes neuronales (`redes/`)**, para un modelo que generalice a otros niveles y fangames.
+  Comparte el emulador y `iwbtgb_rl` con el GA, pero tiene sus propias corridas (`corridas_redes/`), app y
+  videos: no mezclarlo con `ga/`. Plan y estado en `docs/redes.md`. Hecho: vista semántica (`OP_GRID`), núcleo de entrenamiento (Deep
+  GA) y app (`redes.app`: entrenar, probar en otras salas, videos, gráficos y en vivo). Prototipo de gimnasio
+  (`redes/gimnasio.py`): salas generadas dentro del juego real (en `rStageBace`), ~6× más rápidas, para entrenar
+  antes de los niveles. Se entrena en él con `--entorno gimnasio` y se sigue en un nivel con `--desde <corrida>`
+  (la app: «Crear y entrenar» → «Dónde practica» y «Partir de la red de»; ver y probar en «Videos y en vivo» y
+  «Probar»). Los videos de una red la dibujan por dentro (`redes/dibujo_red.py`).
 - Detalles del formato GM7 en `docs/formato-gm7.md`; guía y protocolo RL en `docs/entorno-rl.md`. Leerlos
   antes de tocar el lector GM7 o el modo RL.
 
@@ -52,6 +60,15 @@ uv run python -m ga.entrenar --nombre salida01 [--continuar]       # algoritmo g
 uv run python -m ga.visualizar todo --corrida salida01 --cada 10   # videos y gráficos de la corrida
 uv run python -m ga.visualizar vivo --corrida salida01             # ventana (ffplay) con la última generación, mientras entrena
 uv run python -m ga.explorar --nombre ge01 --workers 4 --iteraciones 2000   # Go-Explore (archivo de celdas); --continuar
+uv run python -m redes.vista video --corrida GA_beta_corregida    # redes: vista semántica junto al juego
+uv run python -m redes.entrenar --nombre red01 --workers 10        # redes: neuroevolución; --continuar
+uv run python -m redes.visualizar mejor --corrida red01            # redes: video de la mejor red
+uv run python -m redes.app                                         # redes: interfaz (Qt); en el menú: iwbtgb-redes.desktop
+uv run python -m redes.probar --corrida red01 --sala todas         # redes: probar la mejor red en salas que no vio
+uv run python -m redes.visualizar vivo --corrida red05             # redes: todas las redes juntas, como el GA (ventana)
+uv run python -m redes.visualizar vivo-red --corrida red01         # redes: la mejor red jugando en tiempo real (ventana)
+uv run python -m redes.gimnasio_ver muestras --dificultad -1 --verificar   # gimnasio: salas generadas (imagen)
+uv run python -m redes.gimnasio_ver vivo --agente red07            # gimnasio: una red (o azar/solucion) en salas nuevas
 ```
 
 Rust: se usa el rustc del sistema (1.99, sin rustup). `rust-toolchain.toml` pide 1.77, pero sin rustup se
@@ -63,7 +80,7 @@ ignora. Python: `uv` con `.venv` (numpy, gymnasium, pillow, matplotlib y pyside6
 |---|---|
 | `gm8exe/src/gm7.rs` (nuevo) | Lector GM7. Devuelve `GameAssets` marcados como `GameMaker8_0`. Color clave corregido para sprites con fila de relleno (`padding_row_key`; regla vieja con `OPENGMK_GM7_CLAVE_ESQUINA`) |
 | `gm8exe/src/reader.rs`, `lib.rs` | Detecta GM7 (offset 1980000, versión 700) antes de buscar GM8 |
-| `gm8emulator/src/game/rl.rs` (nuevo) | Servidor RL: STEP (con trazas por frame, `no_draw` y corte al morir), SAVE, LOAD, OBS, QUERY, INFO, EXEC, TRACK y QUIT |
+| `gm8emulator/src/game/rl.rs` (nuevo) | Servidor RL: STEP (con trazas por frame, `no_draw`, corte al morir y grilla), SAVE, LOAD, OBS, QUERY, INFO, EXEC, TRACK, GRID_CONFIG, GRID y QUIT |
 | `gm8emulator/src/game.rs` | `PlayType::Rl`: sin audio, ventana oculta salvo con `OPENGMK_RL_SHOW` |
 | `gm8emulator/src/main.rs` | Opciones `--rl-socket` y `--rl-seed` |
 | `gm8emulator/src/gml/kernel.rs` | `randomize()` y `sleep()` deterministas en modo RL; `sprite_replace` acepta la firma de 9 argumentos de GM7; `file_find_first` convierte `\` a `/` |
@@ -86,6 +103,12 @@ ignora. Python: `uv` con `.venv` (numpy, gymnasium, pillow, matplotlib y pyside6
   build debug con `RUST_BACKTRACE=1`.
 - **El emulador loguea por stdout**, por eso el protocolo RL usa un socket Unix. Las rutas tienen un máximo
   de 108 caracteres: no crear el socket dentro del scratchpad.
+- **`/tmp` es tmpfs (RAM)**: cada emulador crea `/tmp/iwbtgb_*` (8,3 MB, copia del exe). Si su proceso muere sin
+  `close()`, la carpeta queda ocupando RAM sin que aparezca en ningún proceso. Los workers del GA la cierran al
+  salir (`multiprocessing.util.Finalize` + SIGTERM en `iniciar_worker`) y cada `Emulator` nuevo borra las
+  huérfanas (`limpiar_huerfanos`). El sistema no tiene earlyoom ni systemd-oomd: sin RAM se congela en vez de
+  matar un proceso (probable causa del congelamiento del 2026-10-24, con `300A_Stage01_01` y el en vivo
+  abiertos).
 - **Savestates y archivos**: el emulador no guarda los archivos que escribe el juego (`save/`). El cliente
   (`Emulator.save/load`) los copia junto a cada savestate; sin eso, R tras un `load` va al save equivocado.
 - **`player` es persistente**: con `room_goto` conserva sus coordenadas. Hay que reubicarlo en
