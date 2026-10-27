@@ -270,6 +270,7 @@ class Intento:
     avance: float                # mejor fracción del camino a la salida (1 = llegó)
     recorrido: np.ndarray        # (x, y) por frame, vivo
     frame_avance: int = 0        # frame en que alcanzó su mejor avance
+    traza: np.ndarray | None = None  # con `grabar`: registro por frame del jugador (`ga.nucleo.TRAZA_DTYPE`)
     acciones: list[tuple[int, int]] = field(default_factory=list)   # (acción, frames)
 
     @property
@@ -331,21 +332,26 @@ class Gimnasio:
                              stop_on_gone=True)
 
     def jugar(self, politica: "Politica", max_frames: int = 1000, al_frame=None, paciencia: int = 0,
-              cada: int = 2) -> Intento:
+              cada: int = 2, grabar: bool = False) -> Intento:
         """Un intento en la sala construida, hasta llegar, morir, `max_frames` o `paciencia` frames sin mejorar el
         avance (0 = sin límite; termina "estancado").
 
         Para videos, `al_frame(res, accion, salidas)` recibe un cuadro cada `cada` frames de juego (2 = tiempo real
         a 25 cuadros/s; 2·N = N veces más rápido), sea cual sea el ritmo de la política: las decisiones largas se
         emulan en trozos con las mismas teclas (el emulador las mantiene apretadas: da lo mismo que un paso largo) y
-        el emulador solo dibuja en los pasos que se muestran."""
+        el emulador solo dibuja en los pasos que se muestran. Con `grabar`, el intento trae la traza por frame (para
+        dibujar después a toda la población junta)."""
+        from ga.nucleo import SIN_TECLAS, compactar
         dibujar = al_frame is not None
+        trozos_traza: list[np.ndarray] = []
         self.emu.load(self.SALA)
         politica.reiniciar()
         estado = {"frames": 0, "mejor": 0.0, "fin": None, "frame_mejor": 0}
         recorrido, acciones = [], []
 
-        def revisar(res) -> None:
+        def revisar(res, cod: int) -> None:
+            if grabar:
+                trozos_traza.append(compactar(res.trace, 0, cod))
             vivos = res.trace[res.trace["alive"] == 1]
             for r in vivos:
                 recorrido.append((float(r["x"]), float(r["y"])))
@@ -364,7 +370,7 @@ class Gimnasio:
 
         res = self.paso((), 1, dibujar, politica.usa_vista)
         estado["frames"] = 1
-        revisar(res)
+        revisar(res, SIN_TECLAS)
         if dibujar:
             al_frame(res, None, None)
         pendientes = 0                  # frames de juego desde el último cuadro mostrado
@@ -384,7 +390,7 @@ class Gimnasio:
                     res = self.paso(teclas, t, toca, politica.usa_vista)
                     estado["frames"] += t
                     pendientes = pendientes + t - (cada if toca else 0)
-                    revisar(res)
+                    revisar(res, ACTIONS.index(teclas))
                     if toca:
                         al_frame(res, accion, politica.salidas)
                     if estado["fin"]:
@@ -393,7 +399,7 @@ class Gimnasio:
                     break
         return Intento(estado["fin"], estado["frames"], estado["mejor"],
                        np.array(recorrido, np.float32).reshape(-1, 2), frame_avance=estado["frame_mejor"],
-                       acciones=acciones)
+                       acciones=acciones, traza=np.concatenate(trozos_traza) if grabar else None)
 
     @staticmethod
     def emu_vivo(res) -> bool:
@@ -536,11 +542,12 @@ class JugadorGimnasio:
         partidas = []
         for k, e in enumerate(escenarios):
             self.gim.construir(generar(e.semilla, e.dificultad))
-            it = self.gim.jugar(self.politica, cfg.max_frames, paciencia=int(cfg.paciencia * 50))
+            it = self.gim.jugar(self.politica, cfg.max_frames, paciencia=int(cfg.paciencia * 50), grabar=True)
             final = tuple(float(v) for v in it.recorrido[-1]) if len(it.recorrido) else (0.0, 0.0)
+            # la traza de cada sala (para ver a toda la población junta en el en vivo del entrenamiento)
             partidas.append(Partida(it.avance, it.frame_avance, it.frames, it.fin, final,
                                     acciones=np.array([a for a, _ in it.acciones], np.uint8) if k == 0 else None,
-                                    traza=np.zeros(0, TRAZA_DTYPE) if k == 0 else None))
+                                    traza=it.traza if it.traza is not None else np.zeros(0, TRAZA_DTYPE)))
         puntos = [sum(desglose(cfg, p).values()) for p in partidas]
         return Evaluacion(float(np.mean(puntos)), partidas)
 

@@ -732,18 +732,21 @@ class Ventana(QMainWindow):
     def pestana_visualizar(self) -> QWidget:
         self.v_quien = QComboBox()
         self.v_quien.addItem("La mejor red de la corrida", "mejor")
-        self.v_quien.addItem("Todas las redes de una generación", "todas")
+        self.v_quien.addItem("Todas las redes de la generación", "todas")
         self.v_quien.addItem("Acciones al azar (gimnasio)", "azar")
         self.v_quien.addItem("Solución de la búsqueda (gimnasio)", "solucion")
-        self.v_quien.setToolTip("«La mejor» = la que llega más lejos. «Todas» las dibuja juntas sobre el mapa, como el "
-                                "GA (solo en el nivel donde entrenó). Al azar y la solución sirven para ver las salas "
-                                "del gimnasio: la solución comprueba que cada sala se pueda pasar")
+        self.v_quien.setToolTip("«La mejor» = la que llega más lejos. «Todas» las dibuja juntas, como el GA (donde "
+                                "entrenó). Al azar y la solución sirven para ver las salas del gimnasio: la solución "
+                                "comprueba que cada sala se pueda pasar")
         self.v_donde = QComboBox()
-        self.v_donde.addItem("Donde entrenó", "suya")
-        self.v_donde.addItem("Gimnasio: salas generadas", "gimnasio")
+        self.v_donde.addItem("Donde entrenó (en el gimnasio: el entrenamiento en vivo)", "suya")
+        self.v_donde.addItem("Prueba en el gimnasio: salas nuevas que nunca vio", "gimnasio")
         for s in SALAS:
             self.v_donde.addItem(s, s)
-        self.v_donde.setToolTip("Otro nivel o el gimnasio: salas que la red nunca vio")
+        self.v_donde.setToolTip("Donde entrenó: su nivel o, si entrena en el gimnasio, las mismas salas que jugó la "
+                                "población en la última generación (en vivo pasa a la nueva: se ve cómo aprende). La "
+                                "prueba en el gimnasio y los otros niveles son salas que la red nunca vio: sirven "
+                                "para ver si generaliza")
         for c in (self.v_quien, self.v_donde):
             c.currentIndexChanged.connect(self.al_cambiar_visual)
         self.v_gen = spin(-1, 1_000_000, -1, "última")
@@ -817,10 +820,11 @@ class Ventana(QMainWindow):
             return None
 
     def donde_visual(self) -> str:
-        """Dónde se juega en «Videos y en vivo»: "gimnasio", un nivel, o "" (el nivel donde entrenó)."""
+        """Dónde se juega en «Videos y en vivo»: "entreno" (las salas de la generación de una corrida del gimnasio),
+        "gimnasio" (salas nuevas), un nivel, o "" (el nivel donde entrenó)."""
         quien, donde = self.v_quien.currentData(), self.v_donde.currentData()
         cfg = self.config_actual()
-        suya = "gimnasio" if cfg and cfg.entorno == "gimnasio" else ""
+        suya = "entreno" if cfg and cfg.entorno == "gimnasio" else ""
         if quien in ("azar", "solucion"):
             return "gimnasio"
         if quien == "todas":
@@ -828,22 +832,32 @@ class Ventana(QMainWindow):
         return suya if donde == "suya" else donde
 
     def al_cambiar_visual(self) -> None:
-        quien = self.v_quien.currentData()
-        gim = self.donde_visual() == "gimnasio"
+        quien, donde = self.v_quien.currentData(), self.donde_visual()
+        gim = donde == "gimnasio"
         self.v_donde.setEnabled(quien == "mejor")
         f = self.form_visual
         f.setRowVisible(self.v_gen, quien in ("mejor", "todas"))
-        f.setRowVisible(self.v_espera, quien == "mejor" and not gim)
+        f.setRowVisible(self.v_espera, quien == "mejor" and donde not in ("gimnasio", "entreno"))
         for w in (self.w_v_dif, self.v_semilla, self.v_salas, self.v_verificar):
             f.setRowVisible(w, gim)
-        notas = {
-            "todas": "Todas las redes de la generación sobre el mapa del nivel donde entrenó (las corridas del "
-                     "gimnasio no tienen ese dibujo).",
-            "azar": "Para ver salas del gimnasio con alguien moviéndose.",
-            "solucion": "Antes de cada sala, una búsqueda encuentra cómo pasarla y se ve la solución.",
-        }
-        self.v_nota.setText(notas.get(quien, "El video muestra el juego, el puntaje, la red por dentro (nodos y "
-                                             "conexiones) y qué acción prefiere en cada momento."))
+        if donde == "entreno":
+            nota = ("<b>Entrenamiento en vivo</b>: " +
+                    ("la mejor red de la última generación en las mismas salas que jugó la población, con lo que ve "
+                     "por dentro y cómo le fue al entrenar." if quien == "mejor" else
+                     "toda la población en las salas de su generación: la mejor emulada en vivo y las demás como "
+                     "fantasmas, desde lo que jugaron al entrenar.") +
+                    " En vivo, cuando aparece una generación nueva pasa a sus salas: se ve cómo aprende.")
+        elif quien == "todas":
+            nota = "Todas las redes de la generación sobre el mapa del nivel donde entrenó, como el GA."
+        elif gim and quien == "mejor":
+            nota = ("<b>Prueba</b>: salas nuevas que la red nunca vio, una tras otra, con el historial de cuántas "
+                    "supera: sirve para ver si generaliza.")
+        else:
+            nota = {"azar": "Para ver salas del gimnasio con alguien moviéndose.",
+                    "solucion": "Antes de cada sala, una búsqueda encuentra cómo pasarla y se ve la solución."}.get(
+                quien, "El video muestra el juego, el puntaje, la red por dentro (nodos y conexiones) y qué acción "
+                       "prefiere en cada momento.")
+        self.v_nota.setText(nota)
 
     def visualizar(self, modo: str) -> None:
         if modo == "carpeta-videos":
@@ -871,11 +885,10 @@ class Ventana(QMainWindow):
             return
         vel = ["--velocidad", str(self.v_vel.value())]
         gen = ["--gen", str(self.v_gen.value())]
-        if quien == "todas":
-            if donde == "gimnasio":
-                QMessageBox.information(self, "Videos y en vivo", "«Todas las redes» se dibuja sobre el mapa del nivel: "
-                                        "las corridas del gimnasio no lo tienen. Usa «La mejor red».")
-                return
+        if donde == "entreno":
+            args = (["redes.gimnasio_ver", "entreno", "--agente", nombre, "--quien", quien, *vel] if modo == "vivo"
+                    else ["redes.gimnasio_ver", "entreno-video", "--agente", nombre, "--quien", quien, *gen, *vel])
+        elif quien == "todas":
             args = (["redes.visualizar", "vivo", "--corrida", nombre, *vel] if modo == "vivo" else
                     ["redes.visualizar", "generacion", "--corrida", nombre, *gen, *vel])
         elif donde == "gimnasio":

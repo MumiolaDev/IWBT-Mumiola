@@ -200,6 +200,9 @@ def main() -> None:
             if gimnasio:
                 datos["gimnasio"] = np.array(1)
                 datos["dificultades"] = np.array([e.dificultad for e in escenarios], np.float32)
+                # las trazas de todas las salas: red por red, sala por sala (largos en `traza_largo`, (redes, salas))
+                datos["traza_largo"] = np.array([[len(q.traza) for q in e.partidas] for e in evals], np.int64)
+                datos["trazas"] = np.concatenate([q.traza for e in evals for q in e.partidas])
             almacen.guardar_generacion(carpeta, gen, datos)
             mejor = almacen.indice_mejor(datos)  # la que llega más lejos (no la de más fitness)
             ultima = gen == cfg.generaciones - 1

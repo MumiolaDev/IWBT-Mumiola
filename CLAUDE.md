@@ -69,6 +69,7 @@ uv run python -m redes.visualizar vivo --corrida red05             # redes: toda
 uv run python -m redes.visualizar vivo-red --corrida red01         # redes: la mejor red jugando en tiempo real (ventana)
 uv run python -m redes.gimnasio_ver muestras --dificultad -1 --verificar   # gimnasio: salas generadas (imagen)
 uv run python -m redes.gimnasio_ver vivo --agente red07            # gimnasio: una red (o azar/solucion) en salas nuevas
+uv run python -m redes.gimnasio_ver entreno --agente gym02 --quien todas   # gimnasio: el entrenamiento en vivo (mejor/todas)
 ```
 
 Rust: se usa el rustc del sistema (1.99, sin rustup). `rust-toolchain.toml` pide 1.77, pero sin rustup se

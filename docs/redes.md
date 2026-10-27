@@ -211,6 +211,20 @@ en el nivel mismo da una señal pobre (una partida larga = un número) y cara (~
 - **Ver** (`redes.gimnasio_ver` y la pestaña «Videos y en vivo» de la app): `muestras` (mosaico de 4 columnas, con el
   camino de la solución si se verifica), `vivo` (ventana sin fin con el historial de salas superadas; la red se
   recarga si hay una nueva) y `video`. Salida en `corridas_redes/_gimnasio/` (o en `videos/` de la corrida).
+- **Entrenamiento en vivo** (`gimnasio_ver entreno` / `entreno-video`, 2026-10-27; en la app: «Videos y en vivo»
+  → «Dónde: donde entrenó» con una corrida del gimnasio): las salas de una generación tal como las jugó la
+  población (`semillas` y `dificultades` del `gen_NNNN.npz`). «La mejor»: la mejor red de la generación las juega
+  emulada, con su red por dentro, y la nota «al entrenar: …» (se avisa si al repetirla termina distinto; probado con
+  `gym02`: igual en las 4 salas). «Todas»: la mejor emulada (así se mueven las plataformas) y las demás como
+  fantasmas desde sus trazas, con cruces donde murieron, conteo en juego/llegaron/murieron y el % de salas
+  superadas por generación; si la mejor termina antes, se recarga la sala, se esconde al jugador y se adelanta al
+  mismo frame. En vivo repite las salas de la última generación y pasa a la nueva cuando aparece. Para «todas», el
+  entrenamiento en el gimnasio guarda desde entonces las trazas de **todas** las salas (`traza_largo` (redes,
+  salas); ~0,8 KB por partida comprimido: ~0,7 MB por generación con 200 redes × 4 salas); las generaciones
+  anteriores no las tienen (se avisa antes de abrir la ventana o el video).
+- **Prueba con salas nuevas** (`gimnasio_ver vivo` / `video`; en la app «Prueba en el gimnasio: salas nuevas que
+  nunca vio»): la mejor red en salas que nunca vio, una tras otra, sin fin: no son las del entrenamiento (por eso
+  en el tiempo de una generación se ven muchas más salas), sirve para ver si generaliza.
 - **En vivo a tiempo real** (2026-10-27): un cuadro cada `2·velocidad` frames de juego, siempre a 25 cuadros/s
   (antes una red que decide cada frame daba un cuadro por frame y la ventana iba a la mitad de la velocidad real, y
   ×N pedía N veces más cuadros por segundo); el emulador solo dibuja los pasos que se muestran; la parte fija del
