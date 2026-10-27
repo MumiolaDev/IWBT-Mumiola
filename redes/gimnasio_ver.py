@@ -203,13 +203,16 @@ def jugar_salas(agente: str, dificultad: float, semilla: int, salas: int | None,
     pantalla = Pantalla(nombre, politica)
     if isinstance(politica, PoliticaRed):   # como al entrenar
         tope, paciencia = politica.cfg.max_frames, int(politica.cfg.paciencia * 50)
+        gim_cfg = politica.cfg.entorno == "gimnasio"   # salas como las de su entrenamiento
+        borde = bool(politica.cfg.gim_salida_borde) if gim_cfg else True
+        trampas = bool(politica.cfg.gim_trampas) if gim_cfg else True
     else:
-        tope, paciencia = MAX_FRAMES, 0
+        tope, paciencia, borde, trampas = MAX_FRAMES, 0, True, True
     rng = np.random.default_rng(semilla)
     try:
         n, s = 0, semilla
         while salas is None or n < salas:
-            sala = generar(s, dificultad_de(dificultad, rng))
+            sala = generar(s, dificultad_de(dificultad, rng), borde, trampas)
             s += 1
             gim.construir(sala)
             if politica is None or verificar:
@@ -304,7 +307,9 @@ def generacion(carpeta: Path, gen: int) -> tuple[int, dict]:
 
 
 def salas_de(d: dict) -> list[Sala]:
-    return [generar(int(s), float(f)) for s, f in zip(d["semillas"], d["dificultades"])]
+    borde = bool(d["salida_borde"]) if "salida_borde" in d else False   # generaciones de antes: el portal
+    trampas = bool(d["trampas"]) if "trampas" in d else False           # y sin trampas
+    return [generar(int(s), float(f), borde, trampas) for s, f in zip(d["semillas"], d["dificultades"])]
 
 
 def sin_trazas(corrida: str, g: int) -> SystemExit:

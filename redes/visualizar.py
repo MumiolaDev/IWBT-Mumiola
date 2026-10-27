@@ -8,7 +8,8 @@
 
 `mejor`: la mejor red de la generación (la que llega más lejos) jugando un escenario (`--espera` = frames sin
 control al inicio): el juego grande y al lado el puntaje de la partida con su desglose, el fitness de la red y de su
-generación (promedio y máximo), el gráfico de fitness y la preferencia de la red por cada acción. `--sala`
+generación (promedio y máximo), la red dibujada por dentro (`dibujo_red.py`) y la preferencia de la red por cada
+acción. `--sala`
 la pone en otra sala (que puede no haber visto nunca). Queda en corridas_redes/<nombre>/videos/.
 
 `generacion` y `vivo`: todas las redes de una generación jugando juntas sobre el mapa (su primer escenario), con

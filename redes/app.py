@@ -198,6 +198,16 @@ class Ventana(QMainWindow):
         for w in (QLabel("de"), self.f_gim_min, QLabel("a"), self.f_gim_max):
             fila.addWidget(w)
         fila.addStretch()
+        self.f_gim_borde = QCheckBox("Salida en la pared derecha, como en los niveles")
+        self.f_gim_borde.setToolTip("La salida es una abertura de 3 celdas en la pared derecha, a la altura del suelo "
+                                    "final (correr hacia la derecha lleva a ella). Sin marcar: un portal a 2 celdas de "
+                                    "la pared, como en las primeras corridas (las redes lo pasaban de largo). Se puede "
+                                    "cambiar al continuar")
+        self.f_gim_trampas = QCheckBox("Trampas: púas que saltan, caen o se deslizan y cerezas")
+        self.f_gim_trampas.setToolTip("Como las de los niveles: un disparador invisible suelta una púa o una cereza "
+                                      "cuando el jugador pasa. Púa que salta desde un pozo (dificultad 0,2), púa o "
+                                      "cereza que cae (0,3), púa que se desliza por el suelo (0,4). Se puede cambiar "
+                                      "al continuar")
         self.w_gim_dif.setToolTip("Cada sala sale con una dificultad al azar en este rango. 0: escalones, púas y pozos "
                                   "chicos; desde 0,3 muros (doble salto); 0,4 techos de púas; 0,5 islas; 0,6 "
                                   "plataformas móviles. Los obstáculos crecen con ella. Se puede subir al continuar")
@@ -301,7 +311,8 @@ class Ventana(QMainWindow):
         g_corrida, _ = grupo("1 · Corrida", [("Nombre", self.f_nombre), ("Partir de la red de", self.f_desde)])
         g_donde, self.form_donde = grupo("2 · Dónde practica", [
             ("Entorno", self.f_entorno), ("Sala", self.f_stage), ("Sala de llegada", self.f_objetivo),
-            ("Dificultad del juego", self.f_dificultad), ("Dificultad de las salas", self.w_gim_dif)],
+            ("Dificultad del juego", self.f_dificultad), ("Dificultad de las salas", self.w_gim_dif),
+            ("", self.f_gim_borde), ("", self.f_gim_trampas)],
             arriba=self.l_entorno)
         g_partidas, self.form_partidas = grupo("3 · Partidas de cada red", [
             ("Escenarios por red", self.f_escenarios), ("Duración máxima", self.f_segundos),
@@ -387,6 +398,8 @@ class Ventana(QMainWindow):
         self.f_dificultad.setCurrentText(cfg.difficulty)
         self.f_gim_min.setValue(cfg.gim_dificultad_min)
         self.f_gim_max.setValue(cfg.gim_dificultad_max)
+        self.f_gim_borde.setChecked(bool(cfg.gim_salida_borde))
+        self.f_gim_trampas.setChecked(bool(cfg.gim_trampas))
         self.f_cuadros.setValue(cfg.cuadros)
         self.f_filtros1.setValue(cfg.filtros1)
         self.f_filtros2.setValue(cfg.filtros2)
@@ -440,6 +453,8 @@ class Ventana(QMainWindow):
         for w in (self.f_stage, self.f_objetivo, self.f_dificultad):
             self.form_donde.setRowVisible(w, not gim)
         self.form_donde.setRowVisible(self.w_gim_dif, gim)
+        self.form_donde.setRowVisible(self.f_gim_borde, gim)
+        self.form_donde.setRowVisible(self.f_gim_trampas, gim)
         for w in (self.f_espera, self.f_reintentos, self.f_espera_r):
             self.form_partidas.setRowVisible(w, not gim)
         for w in (self.f_quieto, self.f_r_save, self.f_explorar, self.f_celda):
@@ -484,6 +499,8 @@ class Ventana(QMainWindow):
             "difficulty": self.f_dificultad.currentText(),
             "gim_dificultad_min": float(self.f_gim_min.value()),
             "gim_dificultad_max": float(max(self.f_gim_max.value(), self.f_gim_min.value())),
+            "gim_salida_borde": int(self.f_gim_borde.isChecked()),
+            "gim_trampas": int(self.f_gim_trampas.isChecked()),
             "cuadros": self.f_cuadros.value(), "filtros1": self.f_filtros1.value(),
             "filtros2": self.f_filtros2.value(), "oculta": self.f_oculta.value(),
             "frames_por_decision": self.f_fpd.value(), "soltar_salto": int(self.f_soltar.isChecked()),
@@ -1006,7 +1023,9 @@ class Ventana(QMainWindow):
         texto = [
             f"<b>{nombre}</b>",
             (f"<b>gimnasio</b>: {cfg.escenarios} salas nuevas por generación, dificultad "
-             f"{cfg.gim_dificultad_min:g}–{cfg.gim_dificultad_max:g}" if gim else
+             f"{cfg.gim_dificultad_min:g}–{cfg.gim_dificultad_max:g}, salida "
+             f"{'en la pared' if cfg.gim_salida_borde else 'en un portal antes de la pared'}"
+             f"{', con trampas' if cfg.gim_trampas else ', sin trampas'}" if gim else
              f"<b>nivel</b>: {cfg.start_room} → {cfg.sala_objetivo} · {cfg.difficulty}"),
             (f"partidas de hasta {cfg.max_segundos:g} s (o {cfg.paciencia:g} s sin avanzar); terminan al morir"
              if gim else

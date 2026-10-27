@@ -5,9 +5,12 @@ Las salas se arman en `rStageBace`, una sala del juego casi vacía (jugador, cá
 las mismas instancias que usan los niveles (`block`, `spikeUp`…, `movingPlatform`, `warp`) y los tiles de ladrillo de
 rStage01: la física y las colisiones son las del juego, sin diferencias de simulación. Una sala ocupa una pantalla
 (25 × 19 celdas de 32 px, lo que muestra la cámara), con el jugador a la izquierda y la salida a la derecha. Con
-~120 instancias en vez de las ~970 de rStage01, el emulador corre ~6 veces más rápido.
+~120 instancias en vez de las ~970 de rStage01, el emulador corre ~6 veces más rápido. La salida es una abertura en
+la pared derecha, como las salidas de los niveles (antes del 2026-10-28, un portal a 2 celdas de la pared, que las
+redes pasaban de largo).
 
-Cada sala sale de una semilla y una dificultad (0 a 1): la dificultad habilita obstáculos (muros que piden doble
+Cada sala sale de una semilla y una dificultad (0 a 1), y opcionalmente con trampas (púas que saltan, caen o se
+deslizan y cerezas, con los disparadores del juego): la dificultad habilita obstáculos (muros que piden doble
 salto, techos de púas, islas, plataformas móviles) y agranda pozos, escalones y filas de púas. Los obstáculos respetan
 la física del jugador (salto 8,5 → ~90 px; doble salto 7 → ~150 px en total; 3 px por frame), pero no se garantiza
 que toda sala tenga solución: `resolver` lo comprueba con una búsqueda (archivo de celdas con savestates, como
@@ -43,6 +46,16 @@ TIPOS = {
     "plano": (0.0, 0.6), "escalón": (0.0, 1.5), "púas": (0.0, 1.5), "pozo": (0.0, 1.5),
     "muro": (0.3, 1.0), "techo": (0.4, 0.8), "islas": (0.5, 1.0), "móvil": (0.6, 0.8),
 }
+# Trampas (con `trampas`, desde el 2026-10-28): las piezas del juego, un disparador invisible `triggerNN` y una púa
+# o cereza `spikeTriggerNN`/`cherryTriggerNN` que sale con `direction` y `trapSpeed` cuando el jugador lo toca.
+# Cada trampa de una sala usa otro número (todos los disparadores de un número se activan juntos).
+TIPOS_TRAMPA = {"púa que salta": (0.2, 0.8), "púa que cae": (0.3, 0.8), "púa lateral": (0.4, 0.7)}
+NUMEROS_TRAMPA = {
+    "spikeTrigger_arriba": [1, 2, 5, 6, 15],     # sprSpikeUp
+    "spikeTrigger_abajo": [7, 8, 16],             # sprSpike (apunta hacia abajo)
+    "spikeTrigger_izq": [11, 12],                 # sprSpikeLeft
+    "cherryTrigger": [3, 10, 17],
+}
 
 
 @dataclass
@@ -51,9 +64,16 @@ class Sala:
     dificultad: float
     celdas: np.ndarray                                  # (FILAS, COLS) uint8
     inicio: tuple[int, int]                             # celda (col, fila) donde aparece el jugador
-    meta: tuple[int, int]                               # celda de la salida
+    meta: tuple[int, int]                               # celda de la salida (la de abajo, si es una abertura)
     moviles: list[tuple[float, float, float]] = field(default_factory=list)   # plataformas móviles (x, y, hspeed)
     obstaculos: list[str] = field(default_factory=list)
+    salida: list[tuple[int, int]] = field(default_factory=list)   # celdas de la salida (vacío: solo `meta`)
+    # trampas: (objeto, x, y, GML para la instancia), p. ej. ("spikeTrigger01", 448, 544, "direction = 90; ...")
+    trampas: list[tuple[str, float, float, str]] = field(default_factory=list)
+
+    @property
+    def celdas_salida(self) -> list[tuple[int, int]]:
+        return self.salida or [self.meta]
 
     @property
     def nombre(self) -> str:
@@ -72,6 +92,92 @@ class _Generador:
         self.h = int(self.rng.integers(13, SUELO_MAX + 1))
         self.moviles: list[tuple[float, float, float]] = []
         self.obstaculos: list[str] = []
+        self.trampas: list[tuple[str, float, float, str]] = []
+        self.usados: set[int] = set()       # números de disparador ya usados en esta sala
+        self.salida_borde = True
+        self.con_trampas = False
+
+    def numero(self, tipo: str) -> int | None:
+        libres = [n for n in NUMEROS_TRAMPA[tipo] if n not in self.usados]
+        if not libres:
+            return None
+        n = libres[int(self.rng.integers(len(libres)))]
+        self.usados.add(n)
+        return n
+
+    def disparador(self, n: int, c: int, fila: int, alto: int) -> None:
+        """Disparador invisible `triggerNN` de una celda de ancho y `alto` celdas, desde (c, fila) hacia abajo."""
+        self.trampas.append((f"trigger{n:02d}", c * TILE, fila * TILE,
+                             f"image_yscale = {alto}; triggered = false;"))
+
+    def pua_que_salta(self) -> bool:
+        """Un pozo de púas en el que una de las del fondo sale disparada hacia arriba cuando el jugador llega al
+        borde (como la del pozo de rStage01): hay que esperar a que pase y después saltar."""
+        ancho = self.entero(2, 3)
+        if self.libres() < ancho + 3 or self.h - 4 < 1:
+            return False
+        n = self.numero("spikeTrigger_arriba")
+        if n is None:
+            return False
+        self.plano(1)
+        self.disparador(n, self.col - 1, self.h - 4, 4)
+        trampa = self.col + self.entero(0, ancho - 1)
+        for i in range(ancho):
+            c = self.col + i
+            if c == trampa:
+                self.trampas.append((f"spikeTrigger{n:02d}", c * TILE, (FILAS - 2) * TILE,
+                                     f"direction = 90; trapSpeed = {self.entero(8, 12)};"))
+            else:
+                self.g[FILAS - 2, c] = PUA_ARRIBA
+        self.col += ancho
+        self.plano(2)
+        return True
+
+    def pua_que_cae(self) -> bool:
+        """Una púa (o una cereza) colgando sobre el camino cae cuando el jugador pasa un poco antes de ella: hay que
+        frenar, dejarla caer y seguir."""
+        largo = self.entero(4, 6)
+        if self.libres() < largo + 1 or self.h < 9:
+            return False
+        cereza = self.rng.random() < 0.35
+        n = self.numero("cherryTrigger" if cereza else "spikeTrigger_abajo")
+        if n is None:
+            return False
+        inicio = self.col
+        self.plano(largo)
+        fila = max(1, self.h - self.entero(5, 7))
+        velocidad = self.entero(6, 9) if cereza else self.entero(8, 12)
+        # El disparador va tantas columnas antes como camina el jugador (3 px/frame) mientras la púa baja hasta su
+        # cabeza: quien sigue derecho llega justo debajo; hay que frenar o esperar a que pase
+        caida = (self.h - fila - 1) * TILE - 20
+        antes = int(np.clip(round(3 * caida / velocidad / TILE), 1, largo - 2))
+        c = inicio + antes + self.entero(0, largo - 1 - antes)
+        if cereza:   # el origen de la cereza es su centro
+            self.trampas.append((f"cherryTrigger{n:02d}", c * TILE + 16, fila * TILE + 16,
+                                 f"direction = 270; trapSpeed = {velocidad};"))
+        else:
+            self.trampas.append((f"spikeTrigger{n:02d}", c * TILE, fila * TILE,
+                                 f"direction = 270; trapSpeed = {velocidad};"))
+        self.disparador(n, c - antes, fila, self.h - fila)
+        self.plano(1)
+        return True
+
+    def pua_lateral(self) -> bool:
+        """Al final de un pasillo, una púa que se desliza por el suelo hacia el jugador cuando entra: hay que
+        saltarla."""
+        largo = self.entero(5, 7)
+        if self.libres() < largo + 1 or self.h - 4 < 1:
+            return False
+        n = self.numero("spikeTrigger_izq")
+        if n is None:
+            return False
+        inicio = self.col
+        self.plano(largo)
+        self.trampas.append((f"spikeTrigger{n:02d}", (inicio + largo - 1) * TILE, (self.h - 1) * TILE,
+                             f"direction = 180; trapSpeed = {self.entero(4, 8)};"))
+        self.disparador(n, inicio + 1, self.h - 4, 4)
+        self.plano(1)
+        return True
 
     def suelo(self, c: int, h: int) -> None:
         self.g[h:FILAS - 1, c] = BLOQUE
@@ -195,9 +301,12 @@ class _Generador:
         inicio = (2, self.h - 1)
         metodos = {"plano": lambda: (self.plano(self.entero(1, 2)), True)[1], "escalón": self.escalon,
                    "púas": self.puas, "pozo": self.pozo, "muro": self.muro, "techo": self.techo,
-                   "islas": self.islas, "móvil": self.movil}
-        tipos = [t for t, (dmin, _) in TIPOS.items() if self.d >= dmin]
-        pesos = np.array([TIPOS[t][1] for t in tipos])
+                   "islas": self.islas, "móvil": self.movil, "púa que salta": self.pua_que_salta,
+                   "púa que cae": self.pua_que_cae, "púa lateral": self.pua_lateral}
+        # sin trampas, la misma lista de siempre: las salas viejas salen idénticas
+        catalogo = {**TIPOS, **TIPOS_TRAMPA} if self.con_trampas else TIPOS
+        tipos = [t for t, (dmin, _) in catalogo.items() if self.d >= dmin]
+        pesos = np.array([catalogo[t][1] for t in tipos])
         intentos = 0
         while self.libres() > 0 and intentos < 50:
             intentos += 1
@@ -207,11 +316,23 @@ class _Generador:
                     self.obstaculos.append(tipo)
         while self.col < COLS - 1:
             self.plano(1)
-        return Sala(semilla, self.d, self.g, inicio, (COLS - 3, self.h - 1), self.moviles, self.obstaculos)
+        if not self.salida_borde:   # las primeras salas (hasta el 2026-10-27): un portal a 2 celdas de la pared
+            return Sala(semilla, self.d, self.g, inicio, (COLS - 3, self.h - 1), self.moviles, self.obstaculos,
+                        trampas=self.trampas)
+        # Como en los niveles: una abertura de 3 celdas en la pared derecha, a la altura del suelo final
+        filas = range(self.h - 3, self.h)
+        self.g[list(filas), COLS - 1] = VACIO
+        return Sala(semilla, self.d, self.g, inicio, (COLS - 1, self.h - 1), self.moviles, self.obstaculos,
+                    [(COLS - 1, f) for f in filas], self.trampas)
 
 
-def generar(semilla: int, dificultad: float) -> Sala:
-    return _Generador(semilla, dificultad).generar(semilla)
+def generar(semilla: int, dificultad: float, salida_borde: bool = True, trampas: bool = True) -> Sala:
+    """La sala de esa semilla y dificultad. `salida_borde`: la salida es una abertura en la pared derecha (como en
+    los niveles); False, el portal a 2 celdas de la pared de las primeras corridas del gimnasio. `trampas`: púas que
+    saltan, caen o se deslizan y cerezas (desde dificultad 0,2); sin ellas, las mismas salas de antes."""
+    gen = _Generador(semilla, dificultad)
+    gen.salida_borde, gen.con_trampas = salida_borde, trampas
+    return gen.generar(semilla)
 
 
 # -- en el emulador ---------------------------------------------------------------------------------------
@@ -233,8 +354,10 @@ def gml_sala(sala: Sala) -> str:
                 partes.append(f"tile_add(0,{izq},32,32,32,{x},{y},{PROFUNDIDAD_TILES});")
     for x, y, v in sala.moviles:
         partes.append(f"with (instance_create({x},{y},movingPlatform)) hspeed = {v};")
-    mx, my = sala.meta
-    partes.append(f"with (instance_create({mx * TILE},{my * TILE},warp)) onCollide = false;")
+    for objeto, x, y, codigo in sala.trampas:
+        partes.append(f"with (instance_create({x},{y},{objeto})) {{ {codigo} }}")
+    for mx, my in sala.celdas_salida:   # el portal solo se ve: llegar se detecta en Python (`en_meta`)
+        partes.append(f"with (instance_create({mx * TILE},{my * TILE},warp)) onCollide = false;")
     ix, iy = sala.inicio
     partes.append(f"with (player) {{ x = {ix * TILE + 17}; y = {iy * TILE + 23}; hspeed = 0; vspeed = 0; "
                   f"djump = true; }}")
@@ -247,12 +370,12 @@ def distancias(sala: Sala) -> np.ndarray:
     libre = np.repeat(np.repeat(libre, 2, axis=0), 2, axis=1)
     h, w = libre.shape
     d = np.full((h, w), np.inf)
-    mx, my = sala.meta
     cola = deque()
-    for j in (2 * my, 2 * my + 1):
-        for i in (2 * mx, 2 * mx + 1):
-            d[j, i] = 0
-            cola.append((j, i))
+    for mx, my in sala.celdas_salida:
+        for j in (2 * my, 2 * my + 1):
+            for i in (2 * mx, 2 * mx + 1):
+                d[j, i] = 0
+                cola.append((j, i))
     while cola:
         j, i = cola.popleft()
         for dj, di in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -303,7 +426,8 @@ class Gimnasio:
 
     def construir(self, sala: Sala) -> None:
         """Deja lista la sala para `jugar` (la arma, o reutiliza la que ya estaba armada)."""
-        clave = (sala.semilla, round(sala.dificultad, 6))
+        clave = (sala.semilla, round(sala.dificultad, 6), sala.celdas.tobytes(), tuple(sala.celdas_salida),
+                 tuple(sala.trampas))
         if clave not in self._armadas:
             if len(self._armadas) >= self.MAX_SALAS:
                 self._armadas.clear()
@@ -324,8 +448,12 @@ class Gimnasio:
         return 0.0 if not np.isfinite(d) else float(np.clip(1.0 - d / self.d0, 0.0, 1.0))
 
     def en_meta(self, x: float, y: float) -> bool:
-        mx, my = self.sala.meta[0] * TILE, self.sala.meta[1] * TILE
-        return (x + CAJA[2] >= mx and x + CAJA[0] < mx + TILE and y + CAJA[3] >= my and y + CAJA[1] < my + TILE)
+        """La caja del jugador toca alguna celda de la salida."""
+        for c, f in self.sala.celdas_salida:
+            mx, my = c * TILE, f * TILE
+            if x + CAJA[2] >= mx and x + CAJA[0] < mx + TILE and y + CAJA[3] >= my and y + CAJA[1] < my + TILE:
+                return True
+        return False
 
     def paso(self, teclas: tuple[str, ...], frames: int, dibujar: bool, grilla: bool):
         return self.emu.step(teclas, frames=frames, obs=dibujar, no_draw=not dibujar, grid=grilla, trace=True,
@@ -541,7 +669,7 @@ class JugadorGimnasio:
         red.cargar(red.pesos(genoma, self.cache))
         partidas = []
         for k, e in enumerate(escenarios):
-            self.gim.construir(generar(e.semilla, e.dificultad))
+            self.gim.construir(generar(e.semilla, e.dificultad, bool(cfg.gim_salida_borde), bool(cfg.gim_trampas)))
             it = self.gim.jugar(self.politica, cfg.max_frames, paciencia=int(cfg.paciencia * 50), grabar=True)
             final = tuple(float(v) for v in it.recorrido[-1]) if len(it.recorrido) else (0.0, 0.0)
             # la traza de cada sala (para ver a toda la población junta en el en vivo del entrenamiento)

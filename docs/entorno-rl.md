@@ -118,10 +118,12 @@ objetos, rooms y variables se pueden buscar en `decompiled/gml/`.
 
 ## Ideas y pendientes para cuando se retome
 
-- No se ha entrenado ningún agente. El candidato es PPO de Stable-Baselines3 (`CnnPolicy`, `SubprocVecEnv`,
-  `VecFrameStack(4)`), que hay que agregar con `uv add "stable-baselines3[extra]"`. No se ha probado.
-- Es un juego de muertes constantes, así que conviene un currículo: puntos de inicio intermedios con `exec()`
-  y `save()`, avanzados progresivamente.
+- No se ha entrenado ningún agente con RL. El candidato es PPO de Stable-Baselines3 (`CnnPolicy`,
+  `SubprocVecEnv`, `VecFrameStack(4)`), que hay que agregar con `uv add "stable-baselines3[extra]"`. No se ha
+  probado. Las redes con neuroevolución (`redes/`, `docs/redes.md`) usan la grilla semántica en vez de la imagen y
+  un gimnasio de salas generadas; si el GA se estanca, PPO sobre ese gimnasio es el siguiente paso.
+- El usuario **no quiere** un currículo con puntos de partida a mitad de nivel para las redes (la red debe
+  aprender desde el comienzo); el currículo es la dificultad del gimnasio.
 - Posibles optimizaciones:
   - reducir la imagen dentro de Rust para no transferir 1,4 MB por paso;
   - devolver el estado del jugador dentro de STEP para ahorrar viajes de ida y vuelta.
@@ -286,7 +288,7 @@ uv run python -m ga.explorar --nombre ge01 --continuar --iteraciones 5000
 - `ga.entrenar` se niega a continuar una corrida que tenga `explorar.json`. La app la lista, pero "Continuar"
   desde la app no sirve: se lanza por línea de comandos.
 
-## Estado de las corridas (2026-10-25)
+## Estado de las corridas (2026-10-26)
 
 Todas en `rStage01` → `rStage02`, medium, recompensa `salida`, selección por nichos. "Camino" = mejor fracción
 del camino a la salida alcanzada. Las lanza el usuario desde la app; los valores de config son los actuales
@@ -308,7 +310,7 @@ Con el corregido, sus partidas no se reproducen.
 | `50A_Stage01_01` | 50 / 10 | 120 s | 0 | 100 % | 501 (terminó) | 9,8 % | |
 | `200A_30P` | 200 / 30 | 90 s | 1 | 30 % | 1736 (detenida) | 20,0 % | Detenida al encontrar el error del emulador |
 | `_prueba_ga_alfa` | 200 / 30 | 90 s | 0 | 30 % | 2000 (terminó) | 75,7 % | Prueba con el emulador corregido: 49,8 % en la gen 1800, 75,7 % en la 1999, 5 saves. El mejor final juega 12 frames desde el save 5 y muere: casi todo su avance es heredado |
-| `GA_beta_corregida` | 200 / 50 | 180 s | 0 | 0 % | 43 de 1001 (pausada) | 6,9 % | Emulador corregido; el usuario la sigue desde la app. Hipótesis del usuario: sin herederos también llega, en más generaciones, y el video es una partida continua |
+| `GA_beta_corregida` | 200 / 50 | 180 s | 0 | 0 % | 1637 (detenida el 2026-10-26) | ~47 % | Emulador corregido. Hipótesis del usuario: sin herederos también llega, en más generaciones, y el video es una partida continua. Se estancó en ~47 % y se detuvo para empezar con las redes (`docs/redes.md`) |
 | `test_sala` | 10 / 3 | 60 s | 0 | 100 % | 300 | 3,8 % | Prueba del usuario |
 
 Las corridas de los experimentos 1 y 2 (`rStage01`, `salida01`) ya no existen: el usuario las borró. Sus

@@ -70,7 +70,10 @@ def probar_gimnasio(corrida: str, gen: int, fitness: float, n: int, dificultad: 
     partidas, s = [], semilla
     try:
         while len(partidas) < n:
-            sala = generar(s, float(rng.uniform(0, 1)) if dificultad < 0 else dificultad)
+            gim_cfg = cfg.entorno == "gimnasio"   # salas como las de su entrenamiento
+            borde = bool(cfg.gim_salida_borde) if gim_cfg else True
+            trampas = bool(cfg.gim_trampas) if gim_cfg else True
+            sala = generar(s, float(rng.uniform(0, 1)) if dificultad < 0 else dificultad, borde, trampas)
             s += 1
             gim.construir(sala)
             if verificar and resolver(gim, 600, sala.semilla) is None:

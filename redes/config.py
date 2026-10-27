@@ -11,7 +11,8 @@ ZONAS_AUTO = {"rStage01": "800,0,1600,608"}
 
 # Valores para las corridas guardadas antes de que existiera cada campo (así siguen con las reglas de entonces)
 ANTERIORES = {"castigo_muerte": 0.0, "r_save": 0.0, "reintentos": 0, "castigo_quieto": 0.0, "elite_mas_lejos": 0,
-              "r_explorar": 0.0, "entorno": "nivel", "desde": "", "soltar_salto": 0}
+              "r_explorar": 0.0, "entorno": "nivel", "desde": "", "soltar_salto": 0, "gim_salida_borde": 0,
+              "gim_trampas": 0}
 
 
 @dataclass
@@ -28,6 +29,10 @@ class Config:
     entorno: str = "nivel"
     gim_dificultad_min: float = 0.0     # cada sala con una dificultad al azar entre estas dos
     gim_dificultad_max: float = 0.5
+    gim_salida_borde: int = 1           # la salida de cada sala es una abertura en la pared derecha (como en los
+                                        # niveles); 0 = un portal a 2 celdas de la pared (las primeras corridas)
+    gim_trampas: int = 1                # trampas: púas que saltan (desde dificultad 0,2), que caen o cerezas (0,3)
+                                        # y que se deslizan (0,4)
     # -- partir de una red ya entrenada (p. ej. en el gimnasio) en vez de pesos al azar: la población inicial son
     #    mutaciones de la mejor red de esa corrida (misma forma de red y vista, que se copian de ella)
     desde: str = ""
