@@ -283,8 +283,8 @@ wheels = [
 ]
 
 [[package]]
-name = "iwbtgb-rl"
-version = "0.1.0"
+name = "iwbtgb"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "gymnasium" },

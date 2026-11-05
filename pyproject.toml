@@ -1,7 +1,7 @@
 [project]
-name = "iwbtgb-rl"
-version = "0.1.0"
-description = "Entorno de aprendizaje reforzado para 'I wanna be the GB' corriendo nativo en Linux vía OpenGMK"
+name = "iwbtgb"
+version = "0.2.0"
+description = "I wanna be the GB en Linux (vía OpenGMK) y algoritmos que aprenden a jugarlo: GA con TAS, Go-Explore y redes neuronales"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -16,4 +16,5 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["iwbtgb_rl"]
+packages = ["iwbtgb"]
+

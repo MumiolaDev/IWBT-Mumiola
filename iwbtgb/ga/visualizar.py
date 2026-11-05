@@ -1,0 +1,755 @@
+"""Videos y gráficos de una corrida del algoritmo genético.
+
+    uv run python -m iwbtgb.ga visualizar generacion --corrida salida01 --gen 10   # todos los de la gen 10, juntos
+    uv run python -m iwbtgb.ga visualizar mejor      --corrida salida01 --gen 10   # el mejor, partida real
+    uv run python -m iwbtgb.ga visualizar evolucion  --corrida salida01 --cada 5   # el mejor de cada generación
+    uv run python -m iwbtgb.ga visualizar graficos   --corrida salida01            # PNG con las métricas
+    uv run python -m iwbtgb.ga visualizar todo       --corrida salida01 --cada 10  # todo lo anterior
+    uv run python -m iwbtgb.ga visualizar vivo       --corrida salida01            # ventana con la última generación
+
+`--gen -1` es la última generación guardada. Los videos (1920x1080, 50 FPS, sin audio) quedan en
+corridas/<nombre>/videos/ y los gráficos en corridas/<nombre>/graficos/. `--velocidad 2` acelera al doble.
+
+`vivo` sirve mientras se entrena (en otra terminal): muestra en una ventana (ffplay) todos los agentes de la
+última generación guardada, acelerados (`--velocidad`, 4 por defecto); al terminar salta a la más nueva,
+saltándose las intermedias. Se cierra cerrando la ventana o con Ctrl+C.
+
+`vivo` aguanta horas (stream): corre con tope de memoria (`medios.con_tope_de_memoria`) y su ventana se vigila
+(`medios.EnVivo`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+from .. import distancia
+from ..emulador import ACTIONS
+from ..medios import (AQUA, AZUL, DORADO, FONDO, FPS, H, NARANJA, ROJO, TEXTO, TEXTO_2, TEXTO_3, W, Cerrada, EnVivo,
+                      Video, con_tope_de_memoria, estilo_graficos, fuente, guardar_grafico, hexa, mini_grafico, plural,
+                      tiempo)
+from ..rutas import ROOT
+from . import almacen, recursos
+from .nucleo import (TECLA_R, Config, Resultado, distancias, emulador, muertes_en, preparar, save_points, zonas)
+
+MAPA_W = 1440                      # el mapa ocupa la izquierda; a la derecha va el panel
+PANEL_X = MAPA_W
+
+
+# -- recursos comunes ----------------------------------------------------------------------------------
+
+def con_salida(cfg: Config) -> bool:
+    return bool(cfg.mapa_distancia) and (ROOT / cfg.mapa_distancia).exists()
+
+
+def marcar_salida(img: Image.Image, cfg: Config) -> Image.Image:
+    """Dibuja la salida (recuadro aqua + "SALIDA") y las zonas prohibidas sobre la imagen completa de la room."""
+    rects = zonas(cfg)
+    if not con_salida(cfg) and not rects:
+        return img
+    img = img.copy()
+    capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(capa)
+    for x0, y0, x1, y1 in rects:
+        x1, y1 = min(img.width, x1) - 1, min(img.height, y1) - 1
+        d.rectangle((x0, y0, x1, y1), fill=(220, 40, 40, 45), outline=(220, 40, 40, 200), width=4)
+        d.text(((x0 + x1) / 2, y1 - 12), "ZONA PROHIBIDA (cuenta como muerte)", fill=(255, 90, 90, 255),
+               font=fuente(18, True), anchor="mb", stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    salidas = distancia.cargar(ROOT / cfg.mapa_distancia)["salidas"] if con_salida(cfg) else []
+    for x0, y0, x1, y1 in salidas:
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(img.width - 1, x1), min(img.height - 1, y1)
+        d.rectangle((x0, y0, x1, y1), fill=(*AQUA, 110), outline=(*AQUA, 255), width=3)
+        d.text((x1, y0 - 4), "SALIDA", fill=(*AQUA, 255), font=fuente(16, True), anchor="rb",
+               stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    return Image.alpha_composite(img.convert("RGBA"), capa).convert("RGB")
+
+
+def final_muerte(r, f: int) -> bool:
+    """El último frame de una traza cortada por irse a otra room (cuenta como muerte, aunque esté vivo)."""
+    return r.murio and f == len(r.traza) - 1 and bool(r.traza[f]["alive"])
+
+
+def texto_resultado(r, cfg: Config) -> str:
+    saves = f" · {plural(r.saves, 'save')}" if cfg.save_points or r.saves else ""
+    return f"fitness {r.fitness:.0f} · {100 * r.progreso:.0f} % del camino (máx {100 * r.progreso_max:.0f} %)" + saves
+
+
+def texto_fin(r, cfg: Config) -> str:
+    if r.llego:
+        return "llegó a " + cfg.sala_objetivo
+    if r.murio:
+        return "descalificado (sin reintentos)" if cfg.resets else "murió"
+    return f"sobrevivió {cfg.max_segundos:.0f} s" + (f" ({plural(r.muertes, 'reintento')})" if r.muertes else "")
+
+
+class Escena:
+    """Mapa de la room de entrenamiento escalado al área izquierda + sprites escalados igual."""
+
+    def __init__(self, carpeta: Path, cfg: Config):
+        self.cfg = cfg
+        dir_rec = self.dir_rec = carpeta / "recursos"
+        mapa = recursos.capturar_mapas(dir_rec, cfg, {cfg.room_entrenamiento})[cfg.room_entrenamiento]
+        self.nombre_room = mapa["nombre"]
+        img = marcar_salida(mapa["imagen"], cfg)
+        self.escala = min(MAPA_W / img.width, H / img.height)
+        self.mw, self.mh = int(img.width * self.escala), int(img.height * self.escala)
+        self.ox, self.oy = (MAPA_W - self.mw) // 2, (H - self.mh) // 2
+        self.mapa = img.resize((self.mw, self.mh), Image.LANCZOS)
+        self.sprites = recursos.cargar_sprites(dir_rec)
+        self._cache: dict = {}
+
+    def a_pantalla(self, x: float, y: float) -> tuple[int, int]:
+        return int(self.ox + x * self.escala), int(self.oy + y * self.escala)
+
+    def fondo(self) -> Image.Image:
+        img = Image.new("RGB", (W, H), FONDO)
+        img.paste(self.mapa, (self.ox, self.oy))
+        return img
+
+    def sprite(self, sprite: int, image: int, xscale: int, alpha: float = 1.0, tinte=None, borde=None,
+               escala: float | None = None):
+        """Sprite escalado (RGBA) y su desplazamiento respecto de (x, y) en pantalla."""
+        escala = self.escala if escala is None else escala
+        clave = (sprite, image, xscale, alpha, tinte, borde, escala)
+        if clave in self._cache:
+            return self._cache[clave]
+        s = self.sprites.get(sprite) or self.sprites[min(self.sprites)]
+        img = s["imagenes"][image % len(s["imagenes"])]
+        xo = s["xorig"]
+        if xscale < 0:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            xo = img.width - xo
+        arr = np.asarray(img).astype(np.float32)
+        if tinte is not None:
+            gris = arr[..., :3].mean(-1, keepdims=True) / 255.0
+            arr[..., :3] = 0.35 * arr[..., :3] + 0.65 * gris * np.array(tinte, np.float32) * 1.4
+        if borde is not None:
+            # contorno de 1 px alrededor de los pixeles opacos
+            a = arr[..., 3] > 0
+            pad = np.pad(a, 1)
+            vecino = pad[:-2, 1:-1] | pad[2:, 1:-1] | pad[1:-1, :-2] | pad[1:-1, 2:]
+            anillo = vecino & ~a
+            arr[anillo] = [*borde, 255]
+        arr[..., 3] *= alpha
+        out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
+        e = max(escala, 0.5)
+        tam = (max(1, round(out.width * e)), max(1, round(out.height * e)))
+        out = out.resize(tam, Image.NEAREST)
+        res = (out, round(xo * e), round(s["yorig"] * e))
+        self._cache[clave] = res
+        return res
+
+    def pegar(self, lienzo: Image.Image, reg, a_pantalla=None, escala: float | None = None, **kw) -> None:
+        spr, dx, dy = self.sprite(int(reg["sprite"]), int(reg["image"]), int(reg["xscale"]) or 1, escala=escala, **kw)
+        px, py = (a_pantalla or self.a_pantalla)(float(reg["x"]), float(reg["y"]))
+        lienzo.paste(spr, (px - dx, py - dy), spr)
+
+
+class Camara:
+    """Vista como la del juego: una pantalla de 800x600 (en pasos de 800x608) ampliada a 1440x1080."""
+
+    VW, VH, PASO_Y = 800, 600, 608
+
+    def __init__(self, esc: Escena):
+        self.esc = esc
+        self.z = MAPA_W / self.VW                      # 1.8
+        self.mapa_full = marcar_salida(recursos.capturar_mapas(esc.dir_rec, esc.cfg, {esc.cfg.room_entrenamiento})[
+            esc.cfg.room_entrenamiento]["imagen"], esc.cfg)
+        self.nx = -(-self.mapa_full.width // self.VW)
+        self.ny = -(-self.mapa_full.height // self.PASO_Y)
+        self.bases: dict[tuple[int, int], Image.Image] = {}
+        self.actual = (0, 0)
+        self._candidata, self._cuenta = None, 0
+
+    def pantalla_de(self, x: float, y: float) -> tuple[int, int]:
+        return (int(min(max(x, 0), self.mapa_full.width - 1) // self.VW),
+                int(min(max(y, 0), self.mapa_full.height - 1) // self.PASO_Y))
+
+    def base(self, pantalla) -> Image.Image:
+        if pantalla not in self.bases:
+            sx, sy = pantalla
+            vx, vy = sx * self.VW, sy * self.PASO_Y
+            recorte = Image.new("RGB", (self.VW, self.VH), (0, 0, 0))
+            recorte.paste(self.mapa_full.crop((vx, vy, vx + self.VW, vy + self.VH)), (0, 0))
+            self.bases[pantalla] = recorte.resize((MAPA_W, H), Image.NEAREST)
+        return self.bases[pantalla]
+
+    def a_pantalla(self, x: float, y: float) -> tuple[int, int]:
+        sx, sy = self.actual
+        return int((x - sx * self.VW) * self.z), int((y - sy * self.PASO_Y) * self.z)
+
+    def marcar_muerte(self, x: float, y: float, color=ROJO) -> None:
+        p = self.pantalla_de(x, y)
+        sx, sy = p
+        d = ImageDraw.Draw(self.base(p))
+        marca_muerte(d, int((x - sx * self.VW) * self.z), int((y - sy * self.PASO_Y) * self.z), r=9, color=color)
+
+    def seguir(self, objetivo: tuple[int, int], vacia: bool) -> None:
+        """Cambia de pantalla si el objetivo se mantiene 15 frames (o de inmediato si la actual quedó vacía)."""
+        if objetivo == self.actual:
+            self._candidata, self._cuenta = None, 0
+            return
+        if objetivo == self._candidata:
+            self._cuenta += 1
+        else:
+            self._candidata, self._cuenta = objetivo, 1
+        if vacia or self._cuenta >= 15:
+            self.actual, self._candidata, self._cuenta = objetivo, None, 0
+
+
+class Minimapa:
+    """Mapa completo de la room, chico, para el panel."""
+
+    def __init__(self, cam: Camara, ancho: int):
+        self.cam = cam
+        self.k = ancho / cam.mapa_full.width
+        self.base = cam.mapa_full.resize((ancho, int(cam.mapa_full.height * self.k)), Image.LANCZOS)
+        self.base = Image.blend(self.base, Image.new("RGB", self.base.size, FONDO), 0.35)
+
+    def punto(self, x: float, y: float) -> tuple[int, int]:
+        return int(x * self.k), int(y * self.k)
+
+    def marcar_muerte(self, x: float, y: float) -> None:
+        px, py = self.punto(x, y)
+        ImageDraw.Draw(self.base).ellipse((px - 2, py - 2, px + 2, py + 2), fill=ROJO)
+
+    def dibujar(self, lienzo: Image.Image, ox: int, oy: int, puntos, mejor=None) -> None:
+        img = self.base.copy()
+        d = ImageDraw.Draw(img)
+        sx, sy = self.cam.actual
+        d.rectangle((sx * Camara.VW * self.k, sy * Camara.PASO_Y * self.k,
+                     (sx * Camara.VW + Camara.VW) * self.k - 1, (sy * Camara.PASO_Y + Camara.VH) * self.k - 1),
+                    outline=TEXTO, width=2)
+        for x, y in puntos:
+            px, py = self.punto(x, y)
+            d.rectangle((px - 1, py - 1, px + 1, py + 1), fill=TEXTO)
+        if mejor is not None:
+            px, py = self.punto(*mejor)
+            d.ellipse((px - 4, py - 4, px + 4, py + 4), fill=DORADO)
+        lienzo.paste(img, (ox, oy))
+
+
+def marca_muerte(draw: ImageDraw.ImageDraw, x: int, y: int, r: int = 5, color=ROJO) -> None:
+    draw.line((x - r, y - r, x + r, y + r), fill=color, width=3)
+    draw.line((x - r, y + r, x + r, y - r), fill=color, width=3)
+
+
+def cargar(corrida: str, gen: int):
+    carpeta = almacen.dir_corrida(corrida)
+    gens = almacen.generaciones_guardadas(carpeta)
+    if not gens:
+        raise SystemExit(f"{carpeta} no tiene generaciones")
+    if gen < 0:
+        gen = gens[gen]
+    return carpeta, almacen.cargar_config(carpeta), gen, almacen.cargar_generacion(carpeta, gen)
+
+
+# -- video: todos los agentes de una generación ---------------------------------------------------------
+
+def video_generacion(corrida: str, gen: int, velocidad: int = 1, salida: Path | None = None) -> Path:
+    carpeta, cfg, gen, pob = cargar(corrida, gen)
+    salida = salida or carpeta / "videos" / f"gen_{gen:04d}_todos.mp4"
+    video = Video(salida)
+    for img in cuadros_generacion(carpeta, cfg, gen, pob, velocidad):
+        video.escribir(img)
+    video.cerrar()
+    return salida
+
+
+def vivo(corrida: str, velocidad: int = 4) -> None:
+    """Ventana que reproduce la última generación guardada y salta a la siguiente cuando aparece."""
+    carpeta = almacen.dir_corrida(corrida)
+    mostrada = -1
+    ventana = EnVivo(f"{corrida} · en vivo (x{velocidad})", detalle=lambda: f"gen {mostrada}")
+    try:
+        while ventana.abierta():
+            ventana.revisar()
+            gens = almacen.generaciones_guardadas(carpeta) if carpeta.exists() else []
+            if not gens or gens[-1] == mostrada:
+                time.sleep(1)
+                continue
+            mostrada = gens[-1]
+            # Si se guarda justo mientras se lee, se reintenta en la próxima vuelta
+            try:
+                _, cfg, gen, pob = cargar(corrida, mostrada)
+            except (OSError, ValueError, EOFError):
+                mostrada = -1
+                time.sleep(1)
+                continue
+            for img in cuadros_generacion(carpeta, cfg, gen, pob, velocidad, en_vivo=True):
+                ventana.mostrar(img)
+            del pob
+    except (KeyboardInterrupt, Cerrada):
+        pass
+    finally:
+        ventana.cerrar()
+
+
+def cuadros_generacion(carpeta: Path, cfg: Config, gen: int, pob: list, velocidad: int = 1, en_vivo: bool = False):
+    """Cuadros (1920x1080) con todos los agentes de una generación jugando a la vez. Los de `pob` necesitan `traza`,
+    `llego`, `murio`, `fitness`, `progreso`, `progreso_max`, `saves`, `muertes`, `frames` y `clave()` (un
+    `Resultado` o, en `evolucion`, una red)."""
+    esc = Escena(carpeta, cfg)
+    cam = Camara(esc)
+    metricas = almacen.leer_metricas(carpeta)
+    orden = sorted(range(len(pob)), key=lambda i: pob[i].clave(), reverse=True)
+    mejor = orden[0]
+    largo = max(len(r.traza) for r in pob)
+    sala = cfg.room_entrenamiento
+
+    f_titulo, f_grande, f_med, f_chica = fuente(54, True), fuente(40, True, True), fuente(24), fuente(18)
+    f_num = fuente(30, True, True)
+    x = PANEL_X + 36
+    mm = Minimapa(cam, W - PANEL_X - 72)
+    # Parte fija del panel
+    panel = Image.new("RGB", (W - PANEL_X, H), FONDO)
+    dp = ImageDraw.Draw(panel)
+    px0 = 36
+    dp.text((px0, 34), "Generación", fill=TEXTO_2, font=f_med)
+    dp.text((px0, 60), f"{gen}", fill=TEXTO, font=f_titulo)
+    dp.text((px0, 146), "Tiempo", fill=TEXTO_2, font=f_med)
+    dp.text((px0, 240), "Vivos", fill=TEXTO_2, font=f_med)
+    dp.text((px0 + 220, 240), "Muertes", fill=TEXTO_2, font=f_med)
+    r = pob[mejor]
+    dp.text((px0, 370), "Mejor de la generación", fill=DORADO, font=f_med)
+    dp.text((px0, 400), texto_resultado(r, cfg), fill=TEXTO, font=f_chica)
+    dp.text((px0, 426), f"{texto_fin(r, cfg)} · {tiempo(r.frames)}", fill=TEXTO, font=f_chica)
+    dp.text((px0, 474), f"Mapa de {esc.nombre_room}", fill=TEXTO_2, font=f_med)
+    mm_y = 508
+    graf_y = mm_y + mm.base.height + 40
+    dp.text((px0, graf_y), "Fitness por generación", fill=TEXTO_2, font=f_med)
+    dp.line((px0 + 280, graf_y + 14, px0 + 300, graf_y + 14), fill=AZUL, width=4)
+    dp.text((px0 + 306, graf_y + 14), "máx", fill=TEXTO_2, font=f_chica, anchor="lm")
+    dp.line((px0 + 350, graf_y + 14, px0 + 370, graf_y + 14), fill=NARANJA, width=4)
+    dp.text((px0 + 376, graf_y + 14), "media", fill=TEXTO_2, font=f_chica, anchor="lm")
+    mini_grafico(dp, (px0 + 50, graf_y + 44, W - PANEL_X - 30, H - 50), metricas, gen, f_chica)
+
+    vivo_antes = [True] * len(pob)
+    llegado = [False] * len(pob)
+    n_muertes = llegados = 0
+    estela: list[tuple[float, float]] = []
+    ultima = gen
+    for f in list(range(0, largo, velocidad)) + [largo - 1] * FPS:
+        # Quién está vivo en la sala y dónde
+        vivos_reg, n_vivos = {}, 0
+        for i in orden:
+            t = pob[i].traza
+            if f >= len(t):
+                continue
+            reg = t[f]
+            if not reg["alive"] or final_muerte(pob[i], f):
+                if vivo_antes[i] and f > 0:          # acaba de morir (con reintentos, reaparece después)
+                    vivo_antes[i] = False
+                    n_muertes += 1
+                    ant = t[f - 1] if not reg["alive"] else reg
+                    if ant["room"] == sala:
+                        cam.marcar_muerte(float(ant["x"]), float(ant["y"]) - 8)
+                        mm.marcar_muerte(float(ant["x"]), float(ant["y"]) - 8)
+                continue
+            vivo_antes[i] = True
+            if f == len(t) - 1 and pob[i].llego and not llegado[i]:
+                llegado[i] = True
+                llegados += 1
+            n_vivos += 1
+            if reg["room"] == sala:
+                vivos_reg[i] = reg
+        # Cámara: la pantalla del mejor mientras vive; si no, la que tiene más agentes
+        conteo: dict[tuple[int, int], int] = {}
+        for reg in vivos_reg.values():
+            p = cam.pantalla_de(float(reg["x"]), float(reg["y"]))
+            conteo[p] = conteo.get(p, 0) + 1
+        if mejor in vivos_reg:
+            objetivo = cam.pantalla_de(float(vivos_reg[mejor]["x"]), float(vivos_reg[mejor]["y"]))
+        elif conteo:
+            objetivo = max(conteo, key=conteo.get)
+        else:
+            objetivo = cam.actual
+        cam.seguir(objetivo, conteo.get(cam.actual, 0) == 0)
+
+        img = Image.new("RGB", (W, H), FONDO)
+        img.paste(cam.base(cam.actual), (0, 0))
+        d = ImageDraw.Draw(img)
+        sx, sy = cam.actual
+        for i in orden[::-1]:                        # el mejor al final, encima de todos
+            reg = vivos_reg.get(i)
+            if reg is None or cam.pantalla_de(float(reg["x"]), float(reg["y"])) != cam.actual:
+                continue
+            if i == mejor:
+                continue
+            esc.pegar(img, reg, a_pantalla=cam.a_pantalla, escala=cam.z, alpha=0.55)
+        if mejor in vivos_reg:
+            reg = vivos_reg[mejor]
+            estela.append((float(reg["x"]), float(reg["y"]) - 10))
+            pts = [cam.a_pantalla(px, py) for px, py in estela[-100:]
+                   if cam.pantalla_de(px, py + 10) == cam.actual]
+            if len(pts) > 1:
+                d.line(pts, fill=DORADO, width=3)
+            if cam.pantalla_de(float(reg["x"]), float(reg["y"])) == cam.actual:
+                esc.pegar(img, reg, a_pantalla=cam.a_pantalla, escala=cam.z, borde=DORADO)
+
+        img.paste(panel, (PANEL_X, 0))
+        d.text((x, 172), tiempo(min(f + 1, largo)), fill=TEXTO, font=f_grande)
+        d.text((x, 266), f"{n_vivos} / {len(pob)}", fill=TEXTO, font=f_num)
+        d.text((x + 220, 266), f"{n_muertes}", fill=ROJO, font=f_num)
+        if llegados:
+            d.text((x, 320), f"Llegaron a {cfg.sala_objetivo}: {llegados}", fill=AQUA, font=f_med)
+        mm.dibujar(img, x, mm_y, [(float(r_["x"]), float(r_["y"])) for i, r_ in vivos_reg.items() if i != mejor],
+                   (float(vivos_reg[mejor]["x"]), float(vivos_reg[mejor]["y"])) if mejor in vivos_reg else None)
+        if en_vivo:
+            if f % (FPS * velocidad) == 0:
+                ultima = (almacen.generaciones_guardadas(carpeta) or [gen])[-1]
+            d.rounded_rectangle((W - 236, 28, W - 36, 68), radius=10, fill=(150, 30, 30))
+            d.text((W - 136, 48), f"EN VIVO · x{velocidad}", fill=TEXTO, font=f_chica, anchor="mm")
+            if ultima > gen:
+                d.text((W - 36, 88), f"entrenando: gen {ultima}", fill=TEXTO_2, font=f_chica, anchor="ra")
+        yield img
+
+
+# -- video: el mejor de una generación, jugando de verdad -------------------------------------------------
+
+def repetir(cfg: Config, r: Resultado, extra: int = FPS, hasta: int | None = None):
+    """Repite la partida en el emulador dibujando cada frame, con las teclas que quedaron en la traza (incluidos
+    los reintentos con R), desde el comienzo de la sala o desde su save heredado. Entrega (frame RGB, registro,
+    teclas) por frame y al final verifica que la repetición coincida con la traza del entrenamiento.
+    `hasta` corta la partida en ese frame.
+    """
+    emu = emulador(cfg)
+    emu.track("player")
+    preparar(emu, cfg, r.inicio)
+    distintos = 0
+    try:
+        for esperado in r.traza[:hasta]:
+            a = int(esperado["accion"])
+            teclas = ACTIONS[a] if a < len(ACTIONS) else (("r",) if a == TECLA_R else ())
+            res = emu.step(teclas, frames=1, obs=True, trace=True)
+            reg = res.trace[0]
+            if esperado["alive"] and (abs(float(reg["x"]) - float(esperado["x"])) > 1e-3
+                                      or abs(float(reg["y"]) - float(esperado["y"])) > 1e-3):
+                distintos += 1
+            yield res.obs, esperado, teclas
+        for _ in range(extra):                       # la muerte o la llegada, sin teclas
+            yield emu.step((), frames=1, obs=True).obs, None, ()
+    finally:
+        emu.close()
+        if distintos:
+            print(f"AVISO: {distintos} frames de la repetición no coinciden con la traza del entrenamiento")
+
+
+def video_mejor(corrida: str, gen: int, salida: Path | None = None, completo: bool = True) -> Path:
+    """El mejor agente de la generación jugando de verdad. Si parte de un save heredado y `completo`, antes se
+    ven los tramos de sus ancestros: cada uno juega hasta activar el save desde el que parte el siguiente."""
+    carpeta, cfg, gen, pob = cargar(corrida, gen)
+    esc = Escena(carpeta, cfg)
+    cam = Camara(esc)
+    metricas = almacen.leer_metricas(carpeta)
+    r = max(pob, key=Resultado.clave)
+    tramos = almacen.cadena(carpeta, r) if completo else [(gen, r, None)]
+    salida = salida or carpeta / "videos" / f"gen_{gen:04d}_mejor.mp4"
+    video = Video(salida)
+    sala = cfg.room_entrenamiento
+    puntos = save_points(cfg)
+
+    f_titulo, f_grande, f_med, f_chica = fuente(54, True), fuente(40, True, True), fuente(24), fuente(18)
+    f_tecla = fuente(22, True)
+    x = PANEL_X + 36
+    mm = Minimapa(cam, W - PANEL_X - 72)
+    panel = Image.new("RGB", (W - PANEL_X, H), FONDO)
+    dp = ImageDraw.Draw(panel)
+    px0 = 36
+    dp.text((px0, 34), "Mejor agente · generación", fill=TEXTO_2, font=f_med)
+    dp.text((px0, 60), f"{gen}", fill=DORADO, font=f_titulo)
+    dp.text((px0, 146), "Tiempo", fill=TEXTO_2, font=f_med)
+    salida_on = con_salida(cfg)
+    dp.text((px0, 240), "Camino a la salida" if salida_on else "Celdas exploradas", fill=TEXTO_2, font=f_med)
+    dp.text((px0, 330), texto_resultado(r, cfg), fill=TEXTO_2, font=f_chica)
+    dp.text((px0, 352), texto_fin(r, cfg), fill=TEXTO_2, font=f_chica)
+    dp.text((px0, 474), "Recorrido", fill=TEXTO_2, font=f_med)
+    mm_y = 508
+    graf_y = mm_y + mm.base.height + 40
+    dp.text((px0, graf_y), "Fitness por generación", fill=TEXTO_2, font=f_med)
+    dp.line((px0 + 280, graf_y + 14, px0 + 300, graf_y + 14), fill=AZUL, width=4)
+    dp.text((px0 + 306, graf_y + 14), "máx", fill=TEXTO_2, font=f_chica, anchor="lm")
+    dp.line((px0 + 350, graf_y + 14, px0 + 370, graf_y + 14), fill=NARANJA, width=4)
+    dp.text((px0 + 376, graf_y + 14), "media", fill=TEXTO_2, font=f_chica, anchor="lm")
+    mini_grafico(dp, (px0 + 50, graf_y + 44, W - PANEL_X - 30, H - 50), metricas, gen, f_chica)
+    teclas_def = (("left", "←", 0, 56), ("right", "→", 66, 56), ("shift", "Salto", 132, 110), ("z", "Disparo", 252, 120))
+
+    celdas_vistas: set = set()
+    if salida_on:
+        d0 = float(distancia.cargar(ROOT / cfg.mapa_distancia)["d0"])
+        avance = 0.0
+    recorrido: list[tuple[float, float]] = []
+    ultimo = None
+    reloj = 0  # frames jugados contando los tramos anteriores
+    for nt, (g_tramo, rt, hasta) in enumerate(tramos):
+        final = nt == len(tramos) - 1
+        n = len(rt.traza) if hasta is None else min(hasta, len(rt.traza))
+        vivo = rt.traza["alive"].astype(np.int8)
+        muertes_hasta = np.concatenate([[0], np.cumsum((vivo[:-1] == 1) & (vivo[1:] == 0))])
+        if len(tramos) > 1:
+            desde = f"desde el save {rt.inicio.save + 1}" if rt.inicio else "desde el comienzo"
+            meta = f"hasta activar el save {tramos[nt + 1][1].inicio.save + 1}" if not final else "su partida"
+            rotulo = (f"Tramo {nt + 1} de {len(tramos)} · agente de la gen. {gen if final else g_tramo} · "
+                      f"{desde}, {meta}")
+        for f, (obs, reg, teclas) in enumerate(repetir(cfg, rt, extra=FPS if final else 0, hasta=hasta)):
+            img = Image.new("RGB", (W, H), FONDO)
+            img.paste(Image.fromarray(obs).resize((MAPA_W, H), Image.NEAREST), (0, 0))
+            img.paste(panel, (PANEL_X, 0))
+            d = ImageDraw.Draw(img)
+            if reg is not None and reg["alive"] and reg["room"] == sala:
+                celdas_vistas.add((int(reg["x"]) // cfg.celda, int(reg["y"]) // cfg.celda))
+                ultimo = (float(reg["x"]), float(reg["y"]))
+                recorrido.append(ultimo)
+                cam.actual = cam.pantalla_de(*ultimo)
+                if salida_on:
+                    avance = 1.0 - float(distancias(cfg, np.array([ultimo[0]]), np.array([ultimo[1]]))[0]) / d0
+            d.text((x, 172), tiempo(reloj + min(f + 1, n)), fill=TEXTO, font=f_grande)
+            if salida_on:
+                if final and f >= n and rt.llego:
+                    avance = 1.0
+                d.text((x, 266), f"{100 * avance:.1f} %", fill=TEXTO, font=f_grande)
+            else:
+                d.text((x, 266), f"{len(celdas_vistas)}", fill=TEXTO, font=f_grande)
+            for nombre, etiqueta, bx, bw in teclas_def:
+                on = nombre in teclas
+                d.rounded_rectangle((x + bx, 384, x + bx + bw, 430), radius=8, fill=AZUL if on else (45, 45, 43),
+                                    outline=AZUL if on else TEXTO_3)
+                d.text((x + bx + bw / 2, 407), etiqueta, fill=TEXTO if on else TEXTO_3, font=f_tecla, anchor="mm")
+            if cfg.resets:
+                k = int(muertes_hasta[min(f, n - 1)]) if n else 0
+                d.text((x, 444), f"Intento {min(k + 1, cfg.resets + 1)} de {cfg.resets + 1}"
+                       + ("   · R" if "r" in teclas else ""), fill=TEXTO_2 if k == 0 else NARANJA, font=f_med)
+            mm.dibujar(img, x, mm_y, [], ultimo)
+            if len(recorrido) > 1:
+                d.line([(x + px * mm.k, mm_y + py * mm.k) for px, py in recorrido[::2] + recorrido[-1:]],
+                       fill=DORADO, width=2)
+            for t in tramos[1:]:  # saves desde los que parte algún tramo
+                sx, sy = puntos[t[1].inicio.save]
+                cx, cy = x + sx * mm.k, mm_y + sy * mm.k
+                d.rectangle((cx - 4, cy - 4, cx + 4, cy + 4), outline=AQUA, width=2)
+            if len(tramos) > 1:
+                d.text((20, 16), rotulo, fill=TEXTO, font=f_med, stroke_width=3, stroke_fill=(0, 0, 0))
+            if final and f >= n:
+                estado = "¡LLEGÓ!" if rt.llego else (("DESCALIFICADO" if cfg.resets else "MURIÓ") if rt.murio
+                                                     else "SE ACABÓ EL TIEMPO")
+                d.text((MAPA_W // 2, 80), estado, fill=AQUA if rt.llego else ROJO, font=fuente(72, True),
+                       anchor="mm", stroke_width=4, stroke_fill=(0, 0, 0))
+            video.escribir(img)
+        reloj += n
+    video.cerrar()
+    return salida
+
+
+# -- video: el mejor de cada generación, juntos --------------------------------------------------------
+
+def color_gen(t: float) -> tuple[int, int, int]:
+    """De azul (primeras generaciones) a dorado (últimas)."""
+    a, b = np.array(AZUL, float), np.array(DORADO, float)
+    return tuple(int(v) for v in a + (b - a) * t)
+
+
+def video_evolucion(corrida: str, cada: int = 1, velocidad: int = 1, salida: Path | None = None) -> Path:
+    carpeta = almacen.dir_corrida(corrida)
+    cfg = almacen.cargar_config(carpeta)
+    gens = almacen.generaciones_guardadas(carpeta)
+    elegidas = sorted(set(gens[::cada]) | {gens[-1]})
+    mejores = []
+    for g in elegidas:
+        pob = almacen.cargar_generacion(carpeta, g)
+        mejores.append((g, max(pob, key=Resultado.clave)))
+    esc = Escena(carpeta, cfg)
+    salida = salida or carpeta / "videos" / f"evolucion_cada{cada}.mp4"
+    video = Video(salida)
+    largo = max(len(r.traza) for _, r in mejores)
+    base = esc.fondo()
+    d_base = ImageDraw.Draw(base)
+    f_titulo, f_med, f_chica, f_grande = fuente(48, True), fuente(26), fuente(20), fuente(40, True, True)
+    g_max = max(elegidas) or 1
+    vivo_antes = [True] * len(mejores)
+    sala = cfg.room_entrenamiento
+    # leyenda de color (estática)
+    x = PANEL_X + 36
+    d_base.text((x, 40), "El mejor de cada", fill=TEXTO_2, font=f_med)
+    d_base.text((x, 72), "generación", fill=TEXTO, font=f_titulo)
+    for k in range(300):
+        d_base.line((x + k, 300, x + k, 330), fill=color_gen(k / 299))
+    d_base.text((x, 340), "gen 0", fill=TEXTO_3, font=f_chica)
+    d_base.text((x + 300, 340), f"gen {g_max}", fill=TEXTO_3, font=f_chica, anchor="ra")
+    d_base.text((x, 400), f"{len(mejores)} generaciones", fill=TEXTO_2, font=f_med)
+    d_base.text((x, 1000), f"{esc.nombre_room}", fill=TEXTO_3, font=f_chica)
+
+    for f in list(range(0, largo, velocidad)) + [largo - 1] * FPS:
+        img = base.copy()
+        d = ImageDraw.Draw(img)
+        for k, (g, r) in enumerate(mejores):
+            t = r.traza
+            if f >= len(t):
+                continue
+            reg = t[f]
+            col = color_gen(g / g_max)
+            if not reg["alive"] or final_muerte(r, f):
+                if vivo_antes[k] and f > 0:
+                    vivo_antes[k] = False
+                    ant = t[f - 1] if not reg["alive"] else reg
+                    px, py = esc.a_pantalla(float(ant["x"]), float(ant["y"]) - 8)
+                    marca_muerte(d_base, px, py, color=col)
+                continue
+            vivo_antes[k] = True
+            if reg["room"] != sala:
+                continue
+            esc.pegar(img, reg, tinte=col, borde=col if g == elegidas[-1] else None)
+        d.text((x, 180), "Tiempo", fill=TEXTO_2, font=f_med)
+        d.text((x, 212), tiempo(min(f + 1, largo)), fill=TEXTO, font=f_grande)
+        video.escribir(img)
+    video.cerrar()
+    return salida
+
+
+# -- gráficos -----------------------------------------------------------------------------------------
+
+def graficos(corrida: str) -> list[Path]:
+    plt = estilo_graficos()
+    carpeta = almacen.dir_corrida(corrida)
+    cfg = almacen.cargar_config(carpeta)
+    m = almacen.leer_metricas(carpeta)
+    destino = carpeta / "graficos"
+    destino.mkdir(exist_ok=True)
+    hex_ = hexa
+    g = [r["gen"] for r in m]
+    salidas = []
+
+    def guardar(fig, nombre):
+        guardar_grafico(plt, fig, destino / nombre, salidas)
+
+    fig, ax = plt.subplots(figsize=(12, 6.75))
+    ax.plot(g, [r["fitness_max"] for r in m], color=hex_(AZUL), label="máximo")
+    ax.plot(g, [r["fitness_media"] for r in m], color=hex_(NARANJA), label="media")
+    ax.plot(g, [r["fitness_mediana"] for r in m], color=hex_(AQUA), label="mediana")
+    ax.set_title("Fitness por generación", loc="left", fontsize=18)
+    ax.set_xlabel("generación")
+    ax.set_ylabel("fitness")
+    ax.legend(frameon=False, loc="upper left")
+    guardar(fig, "fitness.png")
+
+    if m and m[0].get("progreso_max") is not None:
+        fig, ax = plt.subplots(figsize=(12, 6.75))
+        ax.plot(g, [r["progreso_max"] for r in m], color=hex_(AZUL), label="lo más lejos que llegó alguien")
+        ax.plot(g, [r["progreso_final_max"] for r in m], color=hex_(AQUA), label="mejor posición al final")
+        ax.plot(g, [r["progreso_media"] for r in m], color=hex_(NARANJA), label="media al final")
+        tope = max(r["progreso_max"] for r in m)
+        if tope > 60:
+            ax.axhline(100, color=hex_(TEXTO_3), linestyle="--", linewidth=1)
+            ax.text(g[-1], 100, "salida ", va="bottom", ha="right", color=hex_(TEXTO_3))
+            ax.set_ylim(top=105)
+        else:  # lejos de la salida: escala ajustada para que se vea el avance
+            ax.set_ylim(min(0, min(r["progreso_media"] for r in m)), max(5.0, tope * 1.35))
+        ax.set_title("Camino recorrido hacia la salida (100 % = la salida)", loc="left", fontsize=18)
+        ax.set_xlabel("generación")
+        ax.set_ylabel("% del camino")
+        ax.legend(frameon=False, loc="upper left")
+        guardar(fig, "progreso.png")
+
+        fig, ax = plt.subplots(figsize=(12, 6.75))
+        ax.plot(g, [r["nichos"] for r in m], color=hex_(AZUL))
+        ax.set_ylim(0, cfg.poblacion * 1.05)
+        ax.set_title(f"Diversidad: lugares distintos donde terminan los {cfg.poblacion} agentes", loc="left",
+                     fontsize=18)
+        ax.set_xlabel("generación")
+        ax.set_ylabel("nichos (cuadros de %d px)" % cfg.nicho_px)
+        guardar(fig, "diversidad.png")
+
+    fig, ax = plt.subplots(figsize=(12, 6.75))
+    ax.plot(g, [r["segundos_medio"] for r in m], color=hex_(AZUL), label="vida media")
+    ax.plot(g, [r["segundos_mejor"] for r in m], color=hex_(NARANJA), label="mejor agente")
+    ax.axhline(cfg.max_segundos, color=hex_(TEXTO_3), linestyle="--", linewidth=1)
+    ax.text(g[0], cfg.max_segundos, f" límite de {cfg.max_segundos:.0f} s", va="bottom", color=hex_(TEXTO_3))
+    ax.set_title("Segundos de juego antes de morir", loc="left", fontsize=18)
+    ax.set_xlabel("generación")
+    ax.set_ylabel("segundos")
+    ax.legend(frameon=False, loc="center left")
+    guardar(fig, "supervivencia.png")
+
+    # Mapa de muertes: dónde murió cada agente (todas sus muertes, con reintentos), todas las generaciones
+    esc = Escena(carpeta, cfg)
+    img = esc.mapa.copy().convert("RGBA")
+    capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    dc = ImageDraw.Draw(capa)
+    gens = almacen.generaciones_guardadas(carpeta)
+    for gi in gens:
+        for r in almacen.cargar_generacion(carpeta, gi):
+            if r.origen == "elite" or len(r.traza) < 2:
+                continue
+            for f in muertes_en(r):
+                reg = r.traza[min(f, len(r.traza)) - 1]
+                if reg["room"] != cfg.room_entrenamiento:
+                    continue
+                px, py = float(reg["x"]) * esc.escala, (float(reg["y"]) - 8) * esc.escala
+                dc.ellipse((px - 6, py - 6, px + 6, py + 6), fill=(255, 70, 60, 110))
+    oscuro = Image.new("RGBA", img.size, (0, 0, 0, 140))
+    img = Image.alpha_composite(Image.alpha_composite(img, oscuro), capa)
+    ruta = destino / "mapa_muertes.png"
+    img.convert("RGB").save(ruta)
+    salidas.append(ruta)
+    print(f"gráfico: {ruta}")
+
+    if con_salida(cfg):
+        salidas.append(mapa_distancia(carpeta, cfg, esc))
+        print(f"gráfico: {salidas[-1]}")
+    return salidas
+
+
+def mapa_distancia(carpeta: Path, cfg: Config, esc: Escena) -> Path:
+    """La "noción de la salida" que tiene el agente: color = distancia por el laberinto, línea = camino corto."""
+    import matplotlib
+    mapa = distancia.cargar(ROOT / cfg.mapa_distancia)
+    d = mapa["dist"] / mapa["dist"].max()
+    rgb = (matplotlib.colormaps["viridis"](1 - d)[..., :3] * 255).astype(np.uint8)
+    rgb[mapa["grilla"] == distancia.MURO] = (30, 30, 30)
+    calor = Image.fromarray(rgb).resize((esc.mw, esc.mh), Image.NEAREST)
+    img = Image.blend(esc.mapa, calor, 0.55)
+    dr = ImageDraw.Draw(img)
+    k = esc.escala
+    dr.line([((i * distancia.PASO + distancia.PASO / 2) * k, (j * distancia.PASO + distancia.DY) * k)
+             for j, i in mapa["ruta"]], fill=(255, 255, 255), width=3)
+    ix, iy = mapa["inicio"]
+    dr.ellipse((ix * k - 8, iy * k - 8, ix * k + 8, iy * k + 8), outline=(255, 255, 255), width=3)
+    ruta = carpeta / "graficos" / "mapa_distancia.png"
+    img.save(ruta)
+    return ruta
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="python -m iwbtgb.ga visualizar", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("modo", choices=["generacion", "mejor", "evolucion", "graficos", "todo", "vivo"])
+    p.add_argument("--corrida", default="rStage01")
+    p.add_argument("--gen", type=int, default=-1)
+    p.add_argument("--cada", type=int, default=10)
+    p.add_argument("--velocidad", type=int, default=None,
+                   help="frames del juego por frame de video (1 por defecto; 4 en vivo)")
+    a = p.parse_args(argv)
+    if a.modo == "vivo":
+        con_tope_de_memoria()
+        vivo(a.corrida, a.velocidad or 4)
+        return
+    a.velocidad = a.velocidad or 1
+    if a.modo == "generacion":
+        video_generacion(a.corrida, a.gen, a.velocidad)
+    elif a.modo == "mejor":
+        video_mejor(a.corrida, a.gen)
+    elif a.modo == "evolucion":
+        video_evolucion(a.corrida, a.cada, a.velocidad)
+    elif a.modo == "graficos":
+        graficos(a.corrida)
+    else:
+        graficos(a.corrida)
+        gens = almacen.generaciones_guardadas(almacen.dir_corrida(a.corrida))
+        for g in sorted(set(gens[::a.cada]) | {gens[-1]}):
+            video_generacion(a.corrida, g, a.velocidad)
+            video_mejor(a.corrida, g)
+        video_evolucion(a.corrida, a.cada, a.velocidad)

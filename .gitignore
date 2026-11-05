@@ -10,6 +10,8 @@
 /corridas
 # Corridas de las redes neuronales (enlace a /mnt/datos/iwbtgb/corridas_redes)
 /corridas_redes
+# Corridas de las redes de rayos (enlace a /mnt/datos/iwbtgb/corridas_rayos)
+/corridas_rayos
 
 .venv/
 __pycache__/

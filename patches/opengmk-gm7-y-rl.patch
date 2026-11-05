@@ -1294,10 +1294,10 @@ index 0000000..d0e2fcd
 +}
 diff --git a/gm8emulator/src/game/rl.rs b/gm8emulator/src/game/rl.rs
 new file mode 100644
-index 0000000..f0c11ce
+index 0000000..e35b7ee
 --- /dev/null
 +++ b/gm8emulator/src/game/rl.rs
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,803 @@
 +//! Frame-by-frame control of the game by an external reinforcement learning client.
 +//!
 +//! The emulator listens on a Unix socket and serves one client. Every request starts with a one-byte
@@ -1313,6 +1313,9 @@ index 0000000..f0c11ce
 +//! | 6  | INFO                                           | i32 room, u32 w, u32 h, u32 speed, u16 len, name, u64 frame |
 +//! | 7  | EXEC: u32 len, GML code                        | u8 status, [u16 len, error] or value                      |
 +//! | 8  | TRACK: u16 len, object name                    | u8 status (0 = ok, 2 = no such object)                     |
++//! | 9  | GRID_CONFIG (see the handler)                  | u8 status, u16 n, n x missing object name                  |
++//! | 10 | GRID                                           | u8 status, grid (and rays, if configured)                  |
++//! | 11 | RAYS_CONFIG: u16 n, u8 step px, u8 c, c x u8   | u8 status (2 = c isn't the number of grid channels)        |
 +//! | 255| QUIT                                           | (none)                                                     |
 +//!
 +//! `obs` is `u32 width, u32 height, width*height*3 bytes RGB, top row first`.
@@ -1350,6 +1353,7 @@ index 0000000..f0c11ce
 +const OP_TRACK: u8 = 8;
 +const OP_GRID_CONFIG: u8 = 9;
 +const OP_GRID: u8 = 10;
++const OP_RAYS_CONFIG: u8 = 11;
 +const OP_QUIT: u8 = 255;
 +
 +const STATUS_OK: u8 = 0;
@@ -1367,7 +1371,24 @@ index 0000000..f0c11ce
 +    height: usize,
 +    samples: i32, // sample points per axis per cell
 +    centre: (i32, i32),
++    rays: Option<Rays>,
 +}
++
++/// Rays from the centre of the tracked instance's bounding box to the edge of the screen (view 0, or the room
++/// without views), using the grid's channels: each ray reports, per channel it sees, the distance to the first
++/// pixel of that channel, and stops at the first pixel of a channel that blocks it (or at the screen's edge).
++/// Ray i points at angle i·2π/n, counter-clockwise on screen starting to the right.
++#[derive(Default)]
++struct Rays {
++    count: usize,
++    step: i32,         // px between samples along a ray (also the raster's resolution)
++    flags: Vec<u8>,    // per channel: RAY_BLOCKS, RAY_SEEN
++    origin: (i32, i32),
++}
++
++const RAY_BLOCKS: u8 = 1;
++const RAY_SEEN: u8 = 2;
++const RAY_NONE: u16 = u16::MAX;
 +
 +struct Channel {
 +    objects: Vec<i32>, // with their children
@@ -1563,9 +1584,32 @@ index 0000000..f0c11ce
 +        }
 +        let left = grid.centre.0 - grid.width as i32 * grid.cell / 2;
 +        let top = grid.centre.1 - grid.height as i32 * grid.cell / 2;
-+        let size = grid.width * grid.height;
-+        let mut out = vec![0u8; grid.channels.len() * size];
-+        for (c, channel) in grid.channels.iter().enumerate() {
++        let mut out = vec![0u8; grid.channels.len() * grid.width * grid.height];
++        if !out.is_empty() {
++            self.rl_raster(&grid.channels, grid, left, top, &mut out);
++        }
++        w.write_i32::<LE>(self.room.id)?;
++        w.write_i32::<LE>(grid.centre.0)?;
++        w.write_i32::<LE>(grid.centre.1)?;
++        w.write_u8(player.is_some() as u8)?;
++        w.write_f64::<LE>(speeds.0)?;
++        w.write_f64::<LE>(speeds.1)?;
++        for value in fields {
++            w.write_f64::<LE>(value)?;
++        }
++        w.write_all(&out)?;
++        if let Some(mut rays) = grid.rays.take() {
++            let result = self.rl_write_rays(&grid.channels, &mut rays, player, w);
++            grid.rays = Some(rays);
++            result?;
++        }
++        Ok(())
++    }
++
++    /// Fills `out` (channels × area.height × area.width) with the coverage of each channel's instances.
++    fn rl_raster(&self, channels: &[Channel], area: &Grid, left: i32, top: i32, out: &mut [u8]) {
++        let size = area.width * area.height;
++        for (c, channel) in channels.iter().enumerate() {
 +            let mut seen = std::collections::HashSet::new();
 +            for &object_index in &channel.objects {
 +                let mut iter = self.room.instance_list.iter_by_identity(object_index);
@@ -1583,20 +1627,186 @@ index 0000000..f0c11ce
 +                            continue
 +                        }
 +                    }
-+                    self.rl_grid_instance(handle, grid, left, top, &mut out[c * size..(c + 1) * size]);
++                    self.rl_grid_instance(handle, area, left, top, &mut out[c * size..(c + 1) * size]);
 +                }
 +            }
 +        }
-+        w.write_i32::<LE>(self.room.id)?;
-+        w.write_i32::<LE>(grid.centre.0)?;
-+        w.write_i32::<LE>(grid.centre.1)?;
-+        w.write_u8(player.is_some() as u8)?;
-+        w.write_f64::<LE>(speeds.0)?;
-+        w.write_f64::<LE>(speeds.1)?;
-+        for value in fields {
-+            w.write_f64::<LE>(value)?;
++    }
++
++    /// Writes the rays: i32 origin x, y, f32 image_xscale of the tracked instance, then per ray one u16 distance
++    /// in px per channel and one more for the screen's edge (`RAY_NONE` = not reached).
++    ///
++    /// Each ray is intersected with the bounding box of every instance of the channels on screen, and only where it
++    /// crosses one is the precise mask sampled (every `step` px), so the cost doesn't depend on the screen's area.
++    fn rl_write_rays(
++        &self,
++        channels: &[Channel],
++        rays: &mut Rays,
++        player: Option<usize>,
++        w: &mut impl Write,
++    ) -> io::Result<()> {
++        let mut xscale = 0.0f32;
++        if let Some(handle) = player {
++            let inst = self.room.instance_list.get(handle);
++            xscale = f64::from(inst.image_xscale.get()) as f32;
++            let mask = if inst.mask_index.get() < 0 { inst.sprite_index.get() } else { inst.mask_index.get() };
++            if let Some(sprite) = self.assets.sprites.get_asset(mask) {
++                inst.update_bbox(Some(sprite.as_ref()));
++                rays.origin = (
++                    (inst.bbox_left.get() + inst.bbox_right.get() + 1) / 2,
++                    (inst.bbox_top.get() + inst.bbox_bottom.get() + 1) / 2,
++                );
++            } else {
++                rays.origin = (inst.x.get().round().to_i32(), inst.y.get().round().to_i32());
++            }
 +        }
-+        w.write_all(&out)
++        // the screen: view 0 if views are on, else the whole room
++        let (sx, sy, sw, sh) = match self.room.views.first() {
++            Some(v) if self.room.views_enabled => (v.source_x, v.source_y, v.source_w, v.source_h),
++            _ => (0, 0, self.room.width, self.room.height),
++        };
++        let (ox, oy) = (f64::from(rays.origin.0) + 0.5, f64::from(rays.origin.1) + 0.5);
++
++        // what a ray can hit: instances of the channels it sees or that block it, with a box on screen
++        struct Target<'a> {
++            channel: usize,
++            blocks: bool,
++            bbox: (i32, i32, i32, i32),
++            collider: &'a crate::asset::sprite::Collider,
++            pos: (i32, i32),
++            origin: (i32, i32),
++            scale: (crate::math::Real, crate::math::Real),
++            sin_cos: (f64, f64),
++        }
++        let mut targets = Vec::new();
++        for (c, channel) in channels.iter().enumerate() {
++            let flags = rays.flags.get(c).copied().unwrap_or(0);
++            if flags & (RAY_BLOCKS | RAY_SEEN) == 0 {
++                continue
++            }
++            let mut seen = std::collections::HashSet::new();
++            for &object_index in &channel.objects {
++                let mut iter = self.room.instance_list.iter_by_identity(object_index);
++                while let Some(handle) = iter.next(&self.room.instance_list) {
++                    let inst = self.room.instance_list.get(handle);
++                    if inst.state.get() != InstanceState::Active || !seen.insert(handle) {
++                        continue
++                    }
++                    if channel.visible_only && (!inst.visible.get() || inst.image_alpha.get() <= 0.into()) {
++                        continue
++                    }
++                    if !channel.exclude.is_empty() {
++                        let parents = inst.parents.borrow();
++                        if channel.exclude.iter().any(|e| parents.contains(e)) {
++                            continue
++                        }
++                    }
++                    let mask = if inst.mask_index.get() < 0 { inst.sprite_index.get() } else { inst.mask_index.get() };
++                    let sprite = match self.assets.sprites.get_asset(mask) {
++                        Some(s) => s.as_ref(),
++                        None => continue,
++                    };
++                    inst.update_bbox(Some(sprite));
++                    let collider = match if sprite.per_frame_colliders {
++                        sprite.colliders.get(inst.image_index.get().floor().into_inner() as usize % sprite.colliders.len())
++                    } else {
++                        sprite.colliders.first()
++                    } {
++                        Some(c) => c,
++                        None => continue,
++                    };
++                    let bbox =
++                        (inst.bbox_left.get(), inst.bbox_top.get(), inst.bbox_right.get(), inst.bbox_bottom.get());
++                    if bbox.2 < sx || bbox.0 >= sx + sw || bbox.3 < sy || bbox.1 >= sy + sh {
++                        continue
++                    }
++                    let angle = inst.image_angle.get().to_radians();
++                    targets.push(Target {
++                        channel: c,
++                        blocks: flags & RAY_BLOCKS != 0,
++                        bbox,
++                        collider,
++                        pos: (inst.x.get().round().to_i32(), inst.y.get().round().to_i32()),
++                        origin: (sprite.origin_x, sprite.origin_y),
++                        scale: (inst.image_xscale.get(), inst.image_yscale.get()),
++                        sin_cos: (angle.sin().into_inner(), angle.cos().into_inner()),
++                    });
++                }
++            }
++        }
++
++        w.write_i32::<LE>(rays.origin.0)?;
++        w.write_i32::<LE>(rays.origin.1)?;
++        w.write_f32::<LE>(xscale)?;
++        let step = f64::from(rays.step.max(1));
++        let mut dist = vec![f64::INFINITY; channels.len()];
++        let mut crossings: Vec<(f64, f64, usize)> = Vec::new();
++        for i in 0..rays.count {
++            let angle = i as f64 * std::f64::consts::TAU / rays.count as f64;
++            let (dx, dy) = (angle.cos(), -angle.sin());
++            // distance to the screen's edge
++            let slab = |o: f64, d: f64, lo: f64, hi: f64| -> (f64, f64) {
++                if d.abs() < 1e-12 {
++                    if o >= lo && o < hi { (f64::NEG_INFINITY, f64::INFINITY) } else { (f64::INFINITY, f64::NEG_INFINITY) }
++                } else {
++                    let (a, b) = ((lo - o) / d, (hi - o) / d);
++                    (a.min(b), a.max(b))
++                }
++            };
++            let edge = slab(ox, dx, f64::from(sx), f64::from(sx + sw)).1.min(slab(oy, dy, f64::from(sy), f64::from(sy + sh)).1).max(0.0);
++            // the boxes it crosses, nearest first
++            crossings.clear();
++            for (k, t) in targets.iter().enumerate() {
++                let (ax, bx) = slab(ox, dx, f64::from(t.bbox.0), f64::from(t.bbox.2 + 1));
++                let (ay, by) = slab(oy, dy, f64::from(t.bbox.1), f64::from(t.bbox.3 + 1));
++                let (enter, exit) = (ax.max(ay).max(0.0), bx.min(by).min(edge));
++                if enter < exit {
++                    crossings.push((enter, exit, k));
++                }
++            }
++            crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
++            dist.iter_mut().for_each(|d| *d = f64::INFINITY);
++            let mut blocked = f64::INFINITY;
++            for &(enter, exit, k) in &crossings {
++                if enter > blocked {
++                    break
++                }
++                let t = &targets[k];
++                if !t.blocks && dist[t.channel] <= enter {
++                    continue
++                }
++                // the first point of the ray inside the precise mask
++                let mut along = enter;
++                while along < exit && along <= blocked {
++                    let (px, py) = ((ox + dx * along).floor() as i32, (oy + dy * along).floor() as i32);
++                    if px >= t.bbox.0
++                        && px <= t.bbox.2
++                        && py >= t.bbox.1
++                        && py <= t.bbox.3
++                        && t.collider.check_collision_point_precise(
++                            px, py, t.pos.0, t.pos.1, t.origin.0, t.origin.1, t.scale.0, t.scale.1, t.sin_cos.0,
++                            t.sin_cos.1,
++                        )
++                    {
++                        if along < dist[t.channel] {
++                            dist[t.channel] = along;
++                        }
++                        if t.blocks && along < blocked {
++                            blocked = along;
++                        }
++                        break
++                    }
++                    along += step;
++                }
++            }
++            let px = |d: f64| if d.is_finite() { d.round().min(f64::from(RAY_NONE - 1)) as u16 } else { RAY_NONE };
++            for (c, &d) in dist.iter().enumerate() {
++                let seen = rays.flags.get(c).copied().unwrap_or(0) & RAY_SEEN != 0;
++                w.write_u16::<LE>(if seen && d <= blocked { px(d) } else { RAY_NONE })?;
++            }
++            w.write_u16::<LE>(if blocked.is_finite() { RAY_NONE } else { px(edge) })?;
++        }
++        Ok(())
 +    }
 +
 +    fn rl_object_index(&self, name: &[u8]) -> Option<i32> {
@@ -1763,11 +1973,25 @@ index 0000000..f0c11ce
 +                        reader.read_exact(&mut name)?;
 +                        fields.push(self.compiler.get_field_id(&name));
 +                    }
-+                    grid = Grid { channels, fields, cell, width, height, samples, centre: grid.centre };
++                    // the rays refer to the channels by index: configure them again after this
++                    grid = Grid { channels, fields, cell, width, height, samples, centre: grid.centre, rays: None };
 +                    writer.write_u8(STATUS_OK)?;
 +                    writer.write_u16::<LE>(missing.len() as u16)?;
 +                    for name in missing {
 +                        write_str(&mut writer, &name)?;
++                    }
++                },
++                OP_RAYS_CONFIG => {
++                    // u16 rays (0 = off), u8 px per step, u8 n flags, n x u8 flags (one per grid channel)
++                    let count = reader.read_u16::<LE>()? as usize;
++                    let step = reader.read_u8()?.max(1) as i32;
++                    let mut flags = vec![0u8; reader.read_u8()? as usize];
++                    reader.read_exact(&mut flags)?;
++                    if flags.len() != grid.channels.len() {
++                        writer.write_u8(STATUS_ERROR)?;
++                    } else {
++                        grid.rays = (count > 0).then(|| Rays { count, step, flags, ..Default::default() });
++                        writer.write_u8(STATUS_OK)?;
 +                    }
 +                },
 +                OP_GRID => {
